@@ -13,7 +13,11 @@ import qrcode from 'qrcode'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const dataFile = path.join(__dirname, 'data.json')
+const isVercel = process.env.VERCEL === '1'
+const serverlessDataFile = path.join('/tmp', 'nemosyne-data.json')
+let dataFile =
+  process.env.DATA_FILE ||
+  (isVercel ? serverlessDataFile : path.join(__dirname, 'data.json'))
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -156,7 +160,23 @@ function readStore() {
 }
 
 function writeStore(store) {
-  fs.writeFileSync(dataFile, JSON.stringify(store, null, 2))
+  const payload = JSON.stringify(store, null, 2)
+  try {
+    fs.writeFileSync(dataFile, payload)
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      error.code === 'EROFS' &&
+      dataFile !== serverlessDataFile
+    ) {
+      dataFile = serverlessDataFile
+      fs.writeFileSync(dataFile, payload)
+      return
+    }
+    throw error
+  }
 }
 
 function purgeExpired(store) {
