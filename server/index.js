@@ -704,7 +704,7 @@ app.post(
   },
 )
 
-if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production' && process.env.VERCEL !== '1') {
   const distPath = path.join(process.cwd(), 'dist')
   app.use(express.static(distPath))
   app.get('*', (_req, res) => {
@@ -712,11 +712,15 @@ if (process.env.NODE_ENV === 'production') {
   })
 }
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Password pusher server running on ${port}`)
-})
+if (process.env.VERCEL !== '1') {
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Password pusher server running on ${port}`)
+  })
 
-cron.schedule('*/5 * * * *', () => {
-  const store = loadStore()
-  saveStore(store)
-})
+  cron.schedule('*/5 * * * *', () => {
+    const store = loadStore()
+    saveStore(store)
+  })
+}
+
+export default app

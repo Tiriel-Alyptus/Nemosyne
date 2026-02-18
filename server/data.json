@@ -12,6 +12,19 @@
       "cipher": "iZ+htWeDaHksRASlZLXtDFI74VY=",
       "iv": "uRrp+A7e54TSZ6rR",
       "requiresPassphrase": false
+    },
+    {
+      "id": "4a3e69a0-eaaf-4d41-85e8-f23dd5e6adbd",
+      "ownerType": "anon",
+      "ownerId": "a3732fbb-b776-41cd-96b9-a8eb2194cd85",
+      "kind": "text",
+      "label": "Accès base staging",
+      "createdAtTs": 1771429835028,
+      "expiresAtTs": 1771516232064,
+      "viewsLeft": 3,
+      "cipher": "548CUJfxaLe8UoqCz4wv3BBXvgs=",
+      "iv": "6f/laEgeGfZFFy/0",
+      "requiresPassphrase": false
     }
   ],
   "users": [
@@ -252,6 +265,20 @@
       "ownerId": "8c414255-3538-41ac-857c-01a471f64a78",
       "createdAtTs": 1771429498998,
       "lastSeenTs": 1771429515331
+    },
+    {
+      "id": "66376b81-aa5c-4c7e-a3b0-201be92c0d8a",
+      "ownerType": "anon",
+      "ownerId": "4f22f4c8-73a6-41dd-9045-32a245c7781b",
+      "createdAtTs": 1771429832180,
+      "lastSeenTs": 1771429832368
+    },
+    {
+      "id": "cac022a8-3e66-4c6d-93f9-b4e3f690043b",
+      "ownerType": "anon",
+      "ownerId": "a3732fbb-b776-41cd-96b9-a8eb2194cd85",
+      "createdAtTs": 1771429832249,
+      "lastSeenTs": 1771429835137
     }
   ]
 }

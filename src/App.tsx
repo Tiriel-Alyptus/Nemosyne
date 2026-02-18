@@ -38,6 +38,16 @@ const presets = [
   { label: '24 heures', minutes: 60 * 24 },
   { label: '7 jours', minutes: 60 * 24 * 7 },
 ]
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)
+  ?.trim()
+  .replace(/\/$/, '')
+
+function buildApiUrl(path: string) {
+  if (/^https?:\/\//i.test(path)) return path
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  if (!apiBaseUrl) return normalizedPath
+  return `${apiBaseUrl}${normalizedPath}`
+}
 
 function formatBytes(value: number) {
   if (!Number.isFinite(value)) return '0 B'
@@ -82,7 +92,7 @@ function base64ToArrayBuffer(value: string): ArrayBuffer {
 }
 
 async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(buildApiUrl(path), {
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
     ...options,

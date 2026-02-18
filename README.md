@@ -1,5 +1,28 @@
 # React + TypeScript + Vite
 
+## Deployment URL Strategy (SaaS / multi-clients)
+
+The app now supports dynamic API targeting:
+
+- Default behavior: same-origin API (`/api/*`) so it follows the current domain automatically.
+- Optional override: set `VITE_API_BASE_URL` (example: `https://api.client-a.com`).
+
+Useful env vars:
+
+- `VITE_API_BASE_URL`: frontend API base URL override (optional).
+- `VITE_DEV_API_TARGET`: Vite dev proxy target (default `http://localhost:8787`).
+- `VITE_HTTPS_KEY_PATH` and `VITE_HTTPS_CERT_PATH`: custom HTTPS cert/key in local dev.
+
+Examples:
+
+```bash
+# same-origin (recommended for Vercel fullstack)
+npm run build
+
+# frontend hosted separately from API
+VITE_API_BASE_URL=https://api.example.com npm run build
+```
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:
