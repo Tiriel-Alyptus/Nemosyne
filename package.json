@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run dev:full",
+    "dev:client": "vite",
     "dev:server": "node server/index.js",
     "dev:full": "concurrently -k -n server,client -c red,blue \"node server/index.js\" \"vite\"",
     "build": "tsc -b && vite build",
@@ -32,6 +33,7 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-basic-ssl": "^2.1.4",
     "@vitejs/plugin-react": "^5.1.1",
     "concurrently": "^9.2.1",
     "eslint": "^9.39.1",
