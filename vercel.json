@@ -25,5 +25,8 @@
       "src": "/(.*)",
       "dest": "/index.html"
     }
-  ]
+  ],
+  "env": {
+    "DATABASE_URL": "postgresql://postgres:%Y#ZTL5MQjfcDs8]@db.sejwwvewszuqffwzwbay.supabase.co:5432/postgres"
+  }
 }
