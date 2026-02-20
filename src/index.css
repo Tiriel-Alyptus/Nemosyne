@@ -3,25 +3,25 @@
 
 @layer base {
   :root {
-    color-scheme: light dark;
-    --bg-1: #f5f7ff;
-    --bg-2: #eef2fb;
+    color-scheme: light;
+    --bg-1: #fcfdfd;
+    --bg-2: #f6f8fb;
     --bg-3: #ffffff;
     --ink: #0f172a;
-    --ink-soft: #475569;
-    --primary: #2563eb;
-    --primary-strong: #1d4ed8;
-    --primary-weak: rgba(37, 99, 235, 0.14);
-    --accent: #10b981;
-    --line: rgba(15, 23, 42, 0.12);
+    --ink-soft: #4b5563;
+    --primary: #0f172a;
+    --primary-strong: #0b1220;
+    --primary-weak: rgba(15, 23, 42, 0.08);
+    --accent: #f97316;
+    --line: rgba(15, 23, 42, 0.08);
     --surface: #ffffff;
     --surface-elev: #ffffff;
-    --surface-muted: #f1f5f9;
+    --surface-muted: #f4f6f9;
     --field: #ffffff;
-    --field-muted: #f8fafc;
-    --shadow: 0 24px 70px rgba(15, 23, 42, 0.12);
-    --shadow-strong: 0 24px 80px rgba(15, 23, 42, 0.16);
-    --ring: 0 0 0 3px rgba(37, 99, 235, 0.25);
+    --field-muted: #f7f8fb;
+    --shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+    --shadow-strong: 0 26px 70px rgba(15, 23, 42, 0.12);
+    --ring: 0 0 0 3px rgba(15, 23, 42, 0.18);
   }
 
   :root[data-theme='dark'] {
@@ -56,8 +56,8 @@
     font-family: "Space Grotesk", system-ui, -apple-system, sans-serif;
     color: var(--ink);
     background:
-      radial-gradient(900px 700px at 85% -10%, rgba(37, 99, 235, 0.2), transparent 60%),
-      radial-gradient(800px 700px at 0% 0%, rgba(16, 185, 129, 0.12), transparent 55%),
+      radial-gradient(1200px 820px at 88% -8%, rgba(249, 115, 22, 0.12), transparent 60%),
+      radial-gradient(950px 740px at 8% 12%, rgba(15, 23, 42, 0.08), transparent 58%),
       linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 60%, var(--bg-3) 100%);
   }
 
@@ -67,8 +67,9 @@
     inset: 0;
     pointer-events: none;
     background:
-      radial-gradient(600px 400px at 20% 20%, rgba(37, 99, 235, 0.08), transparent 60%),
-      radial-gradient(700px 500px at 90% 20%, rgba(16, 185, 129, 0.06), transparent 60%);
+      radial-gradient(620px 420px at 22% 26%, rgba(15, 23, 42, 0.06), transparent 62%),
+      radial-gradient(720px 520px at 90% 22%, rgba(249, 115, 22, 0.08), transparent 60%),
+      linear-gradient(120deg, rgba(15, 23, 42, 0.04) 0 1px, transparent 1px);
     mix-blend-mode: normal;
   }
 
