@@ -600,7 +600,7 @@ function Home() {
   }
 
   return (
-    <div className="mx-auto flex min-h-[80vh] w-full max-w-6xl flex-col gap-8">
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 pb-14">
       <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
           <img src={logo} alt="Nemosyne logo" className="h-10 w-10" />
