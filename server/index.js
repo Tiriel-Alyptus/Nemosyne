@@ -32,8 +32,8 @@ const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) {
   throw new Error('DATABASE_URL is required')
 }
-// Default to a relaxed SSL mode in development to play nicely with corp proxies / self-signed MITM certs.
-const dbSslMode = process.env.DB_SSL_MODE || (isProd ? 'verify' : 'relaxed')
+// Default to relaxed SSL to avoid SELF_SIGNED errors with Supabase; opt-in strict verify via DB_SSL_MODE=verify.
+const dbSslMode = process.env.DB_SSL_MODE || 'relaxed'
 const dbSsl =
   process.env.DB_SSL === 'false'
     ? false

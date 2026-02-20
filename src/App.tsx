@@ -569,7 +569,7 @@ function Home() {
     }
   }
 
-  const generatePassword = () => {
+  const generatePassword = (customLength?: number) => {
     const lower = 'abcdefghijklmnopqrstuvwxyz'
     const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     const numbers = '0123456789'
@@ -580,7 +580,9 @@ function Home() {
     if (useNumbers) pool += numbers
     if (useSymbols) pool += symbols
     if (!pool) return
-    const values = new Uint32Array(passwordLength)
+    const length = customLength ?? passwordLength
+    if (!length) return
+    const values = new Uint32Array(length)
     crypto.getRandomValues(values)
     let result = ''
     for (let i = 0; i < values.length; i += 1) {
@@ -598,6 +600,10 @@ function Home() {
       showToast('Impossible de copier.', 'error')
     }
   }
+
+  useEffect(() => {
+    generatePassword()
+  }, [passwordLength, useUpper, useLower, useNumbers, useSymbols])
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 pb-14">
@@ -1126,77 +1132,85 @@ function Home() {
               </p>
               <p className="text-base font-semibold text-[var(--ink)]">Générateur express</p>
             </div>
-            <button
-              type="button"
-              onClick={generatePassword}
-              className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
-            >
-              Nouveau
-            </button>
           </div>
 
-          <div className="mt-4 flex flex-col gap-4">
+          <div className="mt-4">
             <div className="rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-3 py-3">
-              <input
-                value={generatedPassword}
-                readOnly
-                className="w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                placeholder="Génère et copie en 1 clic"
-              />
-              <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
-                  <span>Longueur</span>
-                  <input
-                    type="range"
-                    min={12}
-                    max={48}
-                    value={passwordLength}
-                    onChange={(event) => setPasswordLength(Number(event.target.value))}
-                  />
-                  <span>{passwordLength}</span>
+              <div className="flex flex-col gap-3">
+                <input
+                  value={generatedPassword}
+                  readOnly
+                  className="w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                  placeholder="Génère et copie en 1 clic"
+                />
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
+                    <span>Longueur</span>
+                    <input
+                      type="range"
+                      min={12}
+                      max={48}
+                      value={passwordLength}
+                      onChange={(event) => {
+                        const next = Number(event.target.value)
+                        setPasswordLength(next)
+                        generatePassword(next)
+                      }}
+                    />
+                    <span className="min-w-[2ch] text-right">{passwordLength}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => generatePassword()}
+                      className="pill border border-[var(--primary)] bg-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-white transition hover:opacity-90"
+                    >
+                      Générer
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCopyGenerated}
+                      className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                    >
+                      Copier
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleCopyGenerated}
-                  className="pill border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
-                >
-                  Copier
-                </button>
+                <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={useUpper}
+                      onChange={(event) => setUseUpper(event.target.checked)}
+                    />
+                    Majuscules
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={useLower}
+                      onChange={(event) => setUseLower(event.target.checked)}
+                    />
+                    Minuscules
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={useNumbers}
+                      onChange={(event) => setUseNumbers(event.target.checked)}
+                    />
+                    Chiffres
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={useSymbols}
+                      onChange={(event) => setUseSymbols(event.target.checked)}
+                    />
+                    Symboles
+                  </label>
+                </div>
               </div>
-            </div>
-            <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={useUpper}
-                  onChange={(event) => setUseUpper(event.target.checked)}
-                />
-                Majuscules
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={useLower}
-                  onChange={(event) => setUseLower(event.target.checked)}
-                />
-                Minuscules
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={useNumbers}
-                  onChange={(event) => setUseNumbers(event.target.checked)}
-                />
-                Chiffres
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={useSymbols}
-                  onChange={(event) => setUseSymbols(event.target.checked)}
-                />
-                Symboles
-              </label>
             </div>
           </div>
         </div>
