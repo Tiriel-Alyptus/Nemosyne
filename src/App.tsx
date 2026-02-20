@@ -275,6 +275,12 @@ function Home() {
     date.setMinutes(date.getMinutes() + expiry)
     return date.getTime()
   }, [expiry])
+  const expiresAtLabel = useMemo(() => formatTime(expiresAt), [expiresAt])
+
+  const focusComposer = () => {
+    const editor = document.getElementById('memo-area') as HTMLTextAreaElement | null
+    if (editor) editor.focus()
+  }
 
   useEffect(() => {
     const hydrate = async () => {

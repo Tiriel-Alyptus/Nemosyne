@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import express from 'express'
 import path from 'path'
 import cron from 'node-cron'
@@ -23,12 +24,13 @@ const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) {
   throw new Error('DATABASE_URL is required')
 }
+const dbSslMode = process.env.DB_SSL_MODE || 'verify'
 const dbSsl =
   process.env.DB_SSL === 'false'
     ? false
-    : {
-        rejectUnauthorized: false,
-      }
+    : dbSslMode === 'relaxed'
+        ? { rejectUnauthorized: false }
+        : { rejectUnauthorized: true }
 
 const pool = new Pool({
   connectionString: databaseUrl,
@@ -106,11 +108,13 @@ const mailer =
 
 app.disable('x-powered-by')
 app.set('trust proxy', 1)
-const enableHsts = process.env.ENABLE_HSTS === 'true'
+const enableHsts = process.env.ENABLE_HSTS === 'true' || isProd
 const enableCsp = process.env.ENABLE_CSP === 'true'
 
 app.use(
   helmet({
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
     contentSecurityPolicy: enableCsp
       ? {
           directives: {
@@ -913,5 +917,12 @@ if (process.env.VERCEL !== '1') {
     })
   })
 }
+
+// Final error handler: hide stack in prod
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err, _req, res, _next) => {
+  console.error(err)
+  res.status(500).json({ error: 'server-error' })
+})
 
 export default app
