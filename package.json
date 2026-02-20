@@ -29,6 +29,7 @@
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.13.0",
     "speakeasy": "^2.0.0",
+    "stripe": "^14.25.0",
     "tailwindcss": "^4.1.18"
   },
   "devDependencies": {

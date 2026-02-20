@@ -10,6 +10,7 @@ import argon2 from 'argon2'
 import nodemailer from 'nodemailer'
 import speakeasy from 'speakeasy'
 import qrcode from 'qrcode'
+import Stripe from 'stripe'
 import { Pool } from 'pg'
 
 // Load env vars from .env, then let .env.local override if present (mirrors CRA-style behavior).
@@ -46,6 +47,8 @@ const pool = new Pool({
   ssl: dbSsl,
   max: 10,
 })
+
+let planEnabled = false
 
 // In production on managed DBs, avoid running DDL as non-owner.
 const shouldMigrate = process.env.RUN_MIGRATIONS === 'true'
@@ -94,12 +97,28 @@ async function initDb() {
   `)
 }
 
-const dbReady = shouldMigrate
-  ? initDb().catch((error) => {
+async function ensurePlanSupport() {
+  try {
+    await pool.query(`
+      ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'free';
+      ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS plan_changed_at_ts bigint;
+    `)
+    planEnabled = true
+  } catch (error) {
+    planEnabled = false
+    console.warn('Plan columns unavailable, falling back to starter-only mode', error)
+  }
+}
+
+const dbReady = (async () => {
+  if (shouldMigrate) {
+    await initDb().catch((error) => {
       console.error('Failed to initialize database', error)
       throw error
     })
-  : Promise.resolve()
+  }
+  await ensurePlanSupport()
+})()
 
 const smtpHost = process.env.SMTP_HOST || 'smtp.gmail.com'
 const smtpPort = Number(process.env.SMTP_PORT || 465)
@@ -118,6 +137,15 @@ const mailer =
           pass: smtpPass,
         },
       })
+    : null
+
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY
+const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET
+const stripePricePremium = process.env.STRIPE_PRICE_PREMIUM
+const stripePricePro = process.env.STRIPE_PRICE_PRO
+const stripe =
+  stripeSecretKey && Stripe
+    ? new Stripe(stripeSecretKey, { apiVersion: '2023-10-16' })
     : null
 
 app.disable('x-powered-by')
@@ -148,7 +176,55 @@ app.use(
     hsts: enableHsts,
   }),
 )
-app.use(express.json({ limit: '10mb' }))
+
+// Stripe webhook (doit recevoir le corps brut)
+app.post(
+  '/api/billing/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    if (!stripe || !stripeWebhookSecret) {
+      return res.status(503).send('stripe-unavailable')
+    }
+    const signature = req.headers['stripe-signature']
+    let event
+    try {
+      event = stripe.webhooks.constructEvent(req.body, signature, stripeWebhookSecret)
+    } catch (error) {
+      console.error('Stripe signature failed', error.message)
+      return res.status(400).send(`Webhook Error: ${error.message}`)
+    }
+
+    const applyPlan = async (meta) => {
+      const userId = meta?.userId
+      const plan = meta?.plan
+      if (userId && plan && planCatalog[plan]) {
+        await pool.query(
+          'UPDATE users SET plan = $1, plan_changed_at_ts = $2 WHERE id = $3',
+          [plan, Date.now(), userId],
+        )
+        console.log(`Stripe webhook: plan ${plan} appliqué pour user ${userId}`)
+      }
+    }
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object
+      await applyPlan(session.metadata)
+    } else if (event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object
+      if (invoice.subscription && stripe) {
+        const subscription = await stripe.subscriptions.retrieve(invoice.subscription)
+        await applyPlan(subscription.metadata)
+      }
+    } else if (event.type === 'customer.subscription.updated') {
+      const subscription = event.data.object
+      await applyPlan(subscription.metadata)
+    }
+
+    return res.json({ received: true })
+  },
+)
+
+app.use(express.json({ limit: '25mb' }))
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -200,16 +276,59 @@ app.use('/api', (_req, res, next) => {
 })
 
 const base64Pattern = /^[A-Za-z0-9+/=]+$/
-const maxFileBytes = 5 * 1024 * 1024
-const maxCipherBase64Len = Math.ceil((maxFileBytes * 4) / 3) + 8
-const maxTtlMs = 7 * 24 * 60 * 60 * 1000
-const maxViews = 20
+const absoluteMaxFileBytes = 15 * 1024 * 1024
+const maxCipherBase64Len = Math.ceil((absoluteMaxFileBytes * 4) / 3) + 8
+const defaultMaxTtlMs = 7 * 24 * 60 * 60 * 1000
+const defaultMaxViews = 20
 const maxLabelLength = 64
 const idPattern = /^[0-9a-fA-F-]{36}$/
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const minPasswordLength = 12
 const maxPasswordLength = 128
 const verifyTokenTtlMs = 1000 * 60 * 60
+
+const planCatalog = {
+  free: {
+    id: 'free',
+    label: 'Starter',
+    monthlyPushLimit: 10,
+    maxTtlMs: 24 * 60 * 60 * 1000, // 24h
+    maxViews: 5,
+    maxFileBytes: 2 * 1024 * 1024, // 2MB
+    historyLimit: 5,
+  },
+  premium: {
+    id: 'premium',
+    label: 'Premium',
+    monthlyPushLimit: null, // unlimited
+    maxTtlMs: 3 * 24 * 60 * 60 * 1000, // 72h
+    maxViews: 12,
+    maxFileBytes: 8 * 1024 * 1024, // 8MB
+    historyLimit: 30,
+  },
+  pro: {
+    id: 'pro',
+    label: 'Pro',
+    monthlyPushLimit: null, // unlimited
+    maxTtlMs: defaultMaxTtlMs, // 7 days
+    maxViews: defaultMaxViews,
+    maxFileBytes: absoluteMaxFileBytes, // 15MB
+    historyLimit: 100,
+  },
+}
+
+function getPlanLimits(planId) {
+  return planCatalog[planId] ?? planCatalog.free
+}
+
+function getCurrentCycleBounds(now = Date.now()) {
+  const start = new Date(now)
+  start.setUTCHours(0, 0, 0, 0)
+  start.setUTCDate(1)
+  const next = new Date(start)
+  next.setUTCMonth(next.getUTCMonth() + 1)
+  return { startTs: start.getTime(), nextResetTs: next.getTime() }
+}
 
 function mapUser(row) {
   if (!row) return null
@@ -226,6 +345,8 @@ function mapUser(row) {
     mfaEnabled: row.mfa_enabled,
     mfaSecret: row.mfa_secret,
     mfaTempSecret: row.mfa_temp_secret,
+    plan: row.plan || 'free',
+    planChangedAtTs: row.plan_changed_at_ts ? Number(row.plan_changed_at_ts) : null,
   }
 }
 
@@ -238,6 +359,13 @@ function mapSession(row) {
     createdAtTs: Number(row.created_at_ts),
     lastSeenTs: Number(row.last_seen_ts),
   }
+}
+
+async function getUserById(userId) {
+  const result = await pool.query('SELECT * FROM users WHERE id = $1 LIMIT 1', [
+    userId,
+  ])
+  return mapUser(result.rows[0])
 }
 
 function mapPush(row) {
@@ -269,6 +397,54 @@ function getSummary(item) {
     expiresAtTs: item.expiresAtTs,
     viewsLeft: item.viewsLeft,
     requiresPassphrase: item.requiresPassphrase,
+  }
+}
+
+async function getUsageForUser(userId, planId) {
+  const limits = getPlanLimits(planId)
+  const { startTs, nextResetTs } = getCurrentCycleBounds()
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM pushes
+     WHERE owner_type = 'user' AND owner_id = $1 AND created_at_ts >= $2`,
+    [userId, startTs],
+  )
+  const used = Number(result.rows[0]?.count || 0)
+  return {
+    used,
+    limit: limits.monthlyPushLimit,
+    nextResetTs,
+  }
+}
+
+async function buildPlanResponse(user) {
+  if (!user) {
+    return {
+      plan: 'free',
+      label: planCatalog.free.label,
+      monthlyPushLimit: planCatalog.free.monthlyPushLimit,
+      monthlyUsed: 0,
+      maxTtlMs: planCatalog.free.maxTtlMs,
+      maxViews: planCatalog.free.maxViews,
+      maxFileBytes: planCatalog.free.maxFileBytes,
+      historyLimit: planCatalog.free.historyLimit,
+      nextResetTs: getCurrentCycleBounds().nextResetTs,
+      planEnabled: planEnabled,
+    }
+  }
+  const limits = getPlanLimits(user.plan)
+  const usage = await getUsageForUser(user.id, user.plan)
+  return {
+    plan: user.plan,
+    label: limits.label,
+    monthlyPushLimit: limits.monthlyPushLimit,
+    monthlyUsed: usage.used,
+    maxTtlMs: limits.maxTtlMs,
+    maxViews: limits.maxViews,
+    maxFileBytes: limits.maxFileBytes,
+    historyLimit: limits.historyLimit,
+    nextResetTs: usage.nextResetTs,
+    planEnabled: planEnabled,
   }
 }
 
@@ -358,7 +534,8 @@ async function sendVerificationEmail(email, token, baseUrl) {
   return true
 }
 
-function validatePayload(payload) {
+function validatePayload(payload, planLimits) {
+  const limits = planLimits ?? planCatalog.free
   if (!payload) return { ok: false, error: 'invalid-payload' }
   if (!isSafeBase64(payload.cipher) || !isSafeBase64(payload.iv)) {
     return { ok: false, error: 'invalid-crypto' }
@@ -373,10 +550,22 @@ function validatePayload(payload) {
     return { ok: false, error: 'invalid-dates' }
   }
   const now = Date.now()
-  if (expiresAtTs <= now || expiresAtTs - now > maxTtlMs) {
+  const maxTtlMs = limits.maxTtlMs ?? defaultMaxTtlMs
+  if (expiresAtTs <= now) {
     return { ok: false, error: 'invalid-expiry' }
   }
-  const viewsLeft = Math.min(maxViews, Math.max(1, Number(payload.viewsLeft)))
+  if (expiresAtTs - now > maxTtlMs) {
+    return { ok: false, error: 'plan-expiry-limit' }
+  }
+  const maxViews = limits.maxViews ?? defaultMaxViews
+  const requestedViews = Number(payload.viewsLeft)
+  if (!Number.isFinite(requestedViews) || requestedViews < 1) {
+    return { ok: false, error: 'invalid-views' }
+  }
+  if (requestedViews > maxViews) {
+    return { ok: false, error: 'plan-views-limit' }
+  }
+  const viewsLeft = Math.min(maxViews, Math.max(1, requestedViews))
   if (kind === 'file') {
     if (
       typeof payload.filename !== 'string' ||
@@ -386,8 +575,12 @@ function validatePayload(payload) {
       return { ok: false, error: 'invalid-filename' }
     }
     const size = Number(payload.size)
-    if (!Number.isFinite(size) || size <= 0 || size > maxFileBytes) {
+    const maxFileBytes = limits.maxFileBytes ?? absoluteMaxFileBytes
+    if (!Number.isFinite(size) || size <= 0) {
       return { ok: false, error: 'invalid-file-size' }
+    }
+    if (size > maxFileBytes) {
+      return { ok: false, error: 'plan-file-limit' }
     }
     if (typeof payload.mime !== 'string' || payload.mime.length > 120) {
       return { ok: false, error: 'invalid-mime' }
@@ -508,11 +701,7 @@ app.get('/api/session', async (req, res, next) => {
     const session = req.session
     let user = null
     if (session.ownerType === 'user') {
-      const result = await pool.query(
-        'SELECT * FROM users WHERE id = $1 LIMIT 1',
-        [session.ownerId],
-      )
-      user = mapUser(result.rows[0])
+      user = await getUserById(session.ownerId)
     }
     return res.json({
       authenticated: Boolean(user),
@@ -520,13 +709,100 @@ app.get('/api/session', async (req, res, next) => {
       ownerType: session.ownerType,
       verified: user?.verified ?? false,
       mfaEnabled: user?.mfaEnabled ?? false,
+      plan: user?.plan ?? 'free',
     })
   } catch (error) {
     next(error)
   }
 })
 
+app.get('/api/plan', async (req, res, next) => {
+  try {
+    await dbReady
+    const session = req.session
+    if (session.ownerType !== 'user') {
+      return res.status(401).json({ error: 'unauthorized', plan: 'free' })
+    }
+    const user = await getUserById(session.ownerId)
+    if (!user) {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
+    const plan = await buildPlanResponse(user)
+    return res.json(plan)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/plan/select', authLimiter, async (req, res, next) => {
+  try {
+    await dbReady
+    const session = req.session
+    if (session.ownerType !== 'user') {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
+    const requested =
+      typeof req.body?.plan === 'string' ? req.body.plan.toLowerCase().trim() : ''
+    if (!requested || !planCatalog[requested]) {
+      return res.status(400).json({ error: 'invalid-plan' })
+    }
+    if (!planEnabled) {
+      return res.status(503).json({ error: 'plan-storage-unavailable' })
+    }
+    await pool.query(
+      'UPDATE users SET plan = $1, plan_changed_at_ts = $2 WHERE id = $3',
+      [requested, Date.now(), session.ownerId],
+    )
+    const user = await getUserById(session.ownerId)
+    const plan = await buildPlanResponse(user)
+    return res.json(plan)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/billing/checkout', authLimiter, async (req, res, next) => {
+  try {
+    await dbReady
+    if (req.session.ownerType !== 'user') {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
+    if (!stripe || !stripePricePremium || !stripePricePro) {
+      return res.status(503).json({ error: 'stripe-unavailable' })
+    }
+    const requested =
+      typeof req.body?.plan === 'string' ? req.body.plan.toLowerCase().trim() : ''
+    if (!['premium', 'pro'].includes(requested)) {
+      return res.status(400).json({ error: 'invalid-plan' })
+    }
+    const user = await getUserById(req.session.ownerId)
+    const priceId = requested === 'premium' ? stripePricePremium : stripePricePro
+    const successUrl =
+      typeof req.body?.successUrl === 'string' && req.body.successUrl.startsWith('http')
+        ? req.body.successUrl
+        : `${appUrl}/?checkout=success`
+    const cancelUrl =
+      typeof req.body?.cancelUrl === 'string' && req.body.cancelUrl.startsWith('http')
+        ? req.body.cancelUrl
+        : `${appUrl}/pricing?checkout=cancel`
+
+    const sessionStripe = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      customer_email: user?.email,
+      metadata: { userId: req.session.ownerId, plan: requested },
+      subscription_data: { metadata: { userId: req.session.ownerId, plan: requested } },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+    })
+    return res.json({ url: sessionStripe.url })
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.post('/api/auth/register', authLimiter, async (req, res) => {
+  await dbReady
   const { email, password } = req.body || {}
   const normalizedEmail = typeof email === 'string' ? email.toLowerCase().trim() : ''
   if (!isValidEmail(normalizedEmail)) {
@@ -554,11 +830,38 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   const verifyTokenHash = hashToken(verifyToken)
   const now = Date.now()
   const userId = crypto.randomUUID()
+  const columns = [
+    'id',
+    'email',
+    'password_hash',
+    'created_at_ts',
+    'verified',
+    'verify_token_hash',
+    'verify_token_expires_at',
+    'mfa_enabled',
+    'mfa_secret',
+    'mfa_temp_secret',
+  ]
+  const values = [
+    userId,
+    normalizedEmail,
+    passwordHash,
+    now,
+    false,
+    verifyTokenHash,
+    now + verifyTokenTtlMs,
+    false,
+    null,
+    null,
+  ]
+  if (planEnabled) {
+    columns.push('plan', 'plan_changed_at_ts')
+    values.push('free', now)
+  }
+  const placeholders = columns.map((_, index) => `$${index + 1}`)
   await pool.query(
-    `INSERT INTO users
-      (id, email, password_hash, created_at_ts, verified, verify_token_hash, verify_token_expires_at, mfa_enabled, mfa_secret, mfa_temp_secret)
-     VALUES ($1, $2, $3, $4, FALSE, $5, $6, FALSE, NULL, NULL)`,
-    [userId, normalizedEmail, passwordHash, now, verifyTokenHash, now + verifyTokenTtlMs],
+    `INSERT INTO users (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`,
+    values,
   )
   const sessionId = crypto.randomUUID()
   await pool.query(
@@ -788,11 +1091,23 @@ app.post('/api/auth/logout', async (req, res, next) => {
 })
 
 app.post('/api/push', createLimiter, async (req, res) => {
-  const result = validatePayload(req.body)
+  await dbReady
+  const session = req.session
+  const user = session.ownerType === 'user' ? await getUserById(session.ownerId) : null
+  const planLimits = user ? getPlanLimits(user.plan) : planCatalog.free
+  const usage = user ? await getUsageForUser(user.id, user.plan) : null
+  if (user && planLimits.monthlyPushLimit && usage.used >= planLimits.monthlyPushLimit) {
+    return res.status(403).json({
+      error: 'quota-exceeded',
+      monthlyUsed: usage.used,
+      monthlyLimit: planLimits.monthlyPushLimit,
+      nextResetTs: usage.nextResetTs,
+    })
+  }
+  const result = validatePayload(req.body, planLimits)
   if (!result.ok) {
     return res.status(400).json({ error: result.error })
   }
-  const session = req.session
   const id = crypto.randomUUID()
   const payload = {
     id,
@@ -823,7 +1138,12 @@ app.post('/api/push', createLimiter, async (req, res) => {
         payload.size ?? null,
       ],
     )
-    return res.status(201).json({ id })
+    return res.status(201).json({
+      id,
+      monthlyUsed: usage ? usage.used + 1 : null,
+      monthlyLimit: planLimits.monthlyPushLimit,
+      plan: user?.plan ?? 'free',
+    })
   } catch (error) {
     console.error('Failed to insert push', error)
     return res.status(500).json({ error: 'server-error' })
@@ -838,12 +1158,17 @@ app.post('/api/push/purge', async (_req, res) => {
 app.get('/api/push', async (req, res) => {
   const session = req.session
   const now = Date.now()
+  let historyLimit = 5
+  if (session.ownerType === 'user') {
+    const user = await getUserById(session.ownerId)
+    historyLimit = getPlanLimits(user?.plan).historyLimit ?? 5
+  }
   const result = await pool.query(
     `SELECT * FROM pushes
      WHERE owner_type = $1 AND owner_id = $2 AND expires_at_ts > $3 AND views_left > 0
      ORDER BY created_at_ts DESC
-     LIMIT 5`,
-    [session.ownerType, session.ownerId, now],
+     LIMIT $4`,
+    [session.ownerType, session.ownerId, now, historyLimit],
   )
   const summaries = result.rows.map(mapPush).map(getSummary)
   return res.json({ items: summaries })

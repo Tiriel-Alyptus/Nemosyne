@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import logo from './assets/logo.svg'
+import VaultPage from './vault/VaultPage'
 
 type PushMeta = {
   id: string
@@ -29,6 +30,21 @@ type PushSummary = PushMeta & {
   isExpired: boolean
 }
 
+type PlanId = 'free' | 'premium' | 'pro'
+
+type PlanInfo = {
+  plan: PlanId
+  label: string
+  monthlyPushLimit: number | null
+  monthlyUsed: number
+  maxTtlMs: number
+  maxViews: number
+  maxFileBytes: number
+  historyLimit: number
+  nextResetTs: number
+  planEnabled: boolean
+}
+
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -36,8 +52,111 @@ const presets = [
   { label: '15 minutes', minutes: 15 },
   { label: '1 heure', minutes: 60 },
   { label: '24 heures', minutes: 60 * 24 },
-  { label: '7 jours', minutes: 60 * 24 * 7 },
+  { label: '72 heures', minutes: 60 * 24 * 3, minPlan: 'premium' as PlanId },
+  { label: '7 jours', minutes: 60 * 24 * 7, minPlan: 'pro' as PlanId },
 ]
+
+const planOrder: Record<PlanId, number> = { free: 0, premium: 1, pro: 2 }
+
+function nextResetTimestamp() {
+  const d = new Date()
+  d.setUTCDate(1)
+  d.setUTCHours(0, 0, 0, 0)
+  d.setUTCMonth(d.getUTCMonth() + 1)
+  return d.getTime()
+}
+
+const defaultPlan: PlanInfo = {
+  plan: 'free',
+  label: 'Starter',
+  monthlyPushLimit: 10,
+  monthlyUsed: 0,
+  maxTtlMs: 24 * 60 * 60 * 1000,
+  maxViews: 5,
+  maxFileBytes: 2 * 1024 * 1024,
+  historyLimit: 5,
+  nextResetTs: nextResetTimestamp(),
+  planEnabled: true,
+}
+
+type PlanPricing = {
+  price: string
+  subtitle: string
+  tagline: string
+  features: string[]
+  badge?: string
+  badgeTone?: 'primary' | 'accent'
+}
+
+const planPricing: Record<PlanId, PlanPricing> = {
+  free: {
+    price: '0 €',
+    subtitle: 'Compte gratuit requis',
+    tagline: 'Idéal pour tester et usage perso ponctuel.',
+    features: ['10 pushes / mois', 'Expiration 24h', 'Push de mots de passe gratuits'],
+  },
+  premium: {
+    price: '19 € / mois',
+    subtitle: 'Premium (solo) — aligné sur eu.pwpush.com',
+    tagline: 'Le plus populaire pour les freelancers et petites équipes.',
+    badge: 'Le plus populaire',
+    badgeTone: 'primary',
+    features: [
+      'Push illimités',
+      'Expiration jusqu’à 72h',
+      'Fichiers chiffrés jusqu’à 8 MB',
+      'Journalisation et API',
+    ],
+  },
+  pro: {
+    price: '29 € / mois',
+    subtitle: 'Pro (équipes) — aligné sur eu.pwpush.com',
+    tagline: 'Recommandé pour les organisations exigeantes.',
+    badge: 'Recommandé',
+    badgeTone: 'accent',
+    features: [
+      'Push illimités + 7 jours',
+      'Jusqu’à 20 vues, historique étendu',
+      'Audit avancé, blocage IP / MFA',
+      'Gestionnaire de mots de passe & support prioritaire',
+    ],
+  },
+}
+
+function generateLabel() {
+  const adjectives = [
+    'Brise',
+    'Quartz',
+    'Serein',
+    'Opale',
+    'Nimbus',
+    'Saumon',
+    'Neon',
+    'Ivory',
+    'Cobalt',
+    'Oasis',
+    'Prisme',
+    'Sienna',
+  ]
+  const nouns = [
+    'Atlas',
+    'Lynx',
+    'Nova',
+    'Echo',
+    'Vertex',
+    'Lagune',
+    'Velours',
+    'Comète',
+    'Spline',
+    'Delta',
+    'Fjord',
+    'Granite',
+  ]
+  const adj = adjectives[Math.floor(Math.random() * adjectives.length)]
+  const noun = nouns[Math.floor(Math.random() * nouns.length)]
+  const suffix = Math.floor(100 + Math.random() * 900)
+  return `${adj} ${noun} ${suffix}`
+}
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)
   ?.trim()
   .replace(/\/$/, '')
@@ -65,6 +184,10 @@ function formatTime(ts: number) {
     day: '2-digit',
     month: 'short',
   })
+}
+
+function formatResetDate(ts: number) {
+  return new Date(ts).toLocaleDateString('fr-FR', { day: '2-digit', month: 'short' })
 }
 
 function buildLink(id: string, key?: string) {
@@ -217,6 +340,7 @@ function toSummary(item: PushMeta): PushSummary {
 }
 
 function Home() {
+  const location = useLocation()
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     if (typeof window === 'undefined') return 'light'
     const stored = window.localStorage.getItem('theme')
@@ -229,13 +353,18 @@ function Home() {
     ownerType: 'anon' | 'user'
     verified?: boolean
     mfaEnabled?: boolean
-  }>({ authenticated: false, email: null, ownerType: 'anon' })
+    plan?: PlanId
+  }>({ authenticated: false, email: null, ownerType: 'anon', plan: 'free' })
+  const [plan, setPlan] = useState<PlanInfo>(defaultPlan)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [otp, setOtp] = useState('')
   const [authError, setAuthError] = useState('')
   const [authLoading, setAuthLoading] = useState(false)
   const [showAuth, setShowAuth] = useState(false)
+  const [showUpgrade, setShowUpgrade] = useState(false)
+  const [paywallReason, setPaywallReason] = useState<string | null>(null)
+  const [planLoading, setPlanLoading] = useState(false)
   const [mfaRequired, setMfaRequired] = useState(false)
   const [mfaSetup, setMfaSetup] = useState(false)
   const [mfaQr, setMfaQr] = useState<string | null>(null)
@@ -243,7 +372,7 @@ function Home() {
   const [mode, setMode] = useState<'text' | 'file'>('text')
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState('')
-  const [label] = useState('Accès base staging')
+  const [label, setLabel] = useState<string>(() => generateLabel())
   const [views, setViews] = useState(3)
   const [expiry, setExpiry] = useState(presets[2].minutes)
   const [passphrase, setPassphrase] = useState('')
@@ -270,16 +399,111 @@ function Home() {
     }, 2200)
   }
 
+  const remainingPushes = useMemo(() => {
+    if (plan.monthlyPushLimit === null) return null
+    return Math.max(0, plan.monthlyPushLimit - plan.monthlyUsed)
+  }, [plan])
+  const expiryLimitMinutes = useMemo(
+    () => Math.floor(plan.maxTtlMs / (60 * 1000)),
+    [plan.maxTtlMs],
+  )
+  const paywallQuotaReached =
+    plan.monthlyPushLimit !== null && plan.monthlyUsed >= plan.monthlyPushLimit
+
+  useEffect(() => {
+    if (expiry > expiryLimitMinutes) {
+      setExpiry(expiryLimitMinutes)
+    }
+  }, [expiry, expiryLimitMinutes])
+
   const expiresAt = useMemo(() => {
     const date = new Date()
     date.setMinutes(date.getMinutes() + expiry)
     return date.getTime()
   }, [expiry])
   const expiresAtLabel = useMemo(() => formatTime(expiresAt), [expiresAt])
+  const pushProgress = useMemo(() => {
+    if (plan.monthlyPushLimit === null) return 100
+    if (plan.monthlyPushLimit === 0) return 0
+    return Math.min(100, (plan.monthlyUsed / plan.monthlyPushLimit) * 100)
+  }, [plan.monthlyPushLimit, plan.monthlyUsed])
 
   const focusComposer = () => {
     const editor = document.getElementById('memo-area') as HTMLTextAreaElement | null
     if (editor) editor.focus()
+  }
+
+  const triggerUpgrade = (reason: string) => {
+    setPaywallReason(reason)
+    setShowUpgrade(true)
+  }
+
+  const fetchPlanInfo = async (sessionOverride?: {
+    authenticated: boolean
+    plan?: PlanId
+  }) => {
+    const targetSession = sessionOverride ?? auth
+    if (!targetSession.authenticated) {
+      setPlan(defaultPlan)
+      return
+    }
+    try {
+      const planData = await apiRequest<PlanInfo>('/api/plan')
+      setPlan(planData)
+    } catch {
+      setPlan(defaultPlan)
+    }
+  }
+
+  const handleSelectPlan = async (nextPlan: PlanId) => {
+    if (nextPlan === 'free') {
+      setPlan(defaultPlan)
+      setShowUpgrade(false)
+      return
+    }
+    if (!auth.authenticated) {
+      setShowAuth(true)
+      triggerUpgrade('Connexion requise pour choisir un plan')
+      return
+    }
+    setPlanLoading(true)
+    try {
+      if (nextPlan === 'premium' || nextPlan === 'pro') {
+        const origin = typeof window !== 'undefined' ? window.location.origin : ''
+        const successUrl = `${origin}/?checkout=success`
+        const cancelUrl = `${origin}/pricing?checkout=cancel`
+        const checkout = await apiRequest<{ url: string }>('/api/billing/checkout', {
+          method: 'POST',
+          body: JSON.stringify({ plan: nextPlan, successUrl, cancelUrl }),
+        })
+        if (!checkout.url) {
+          throw new Error('stripe-unavailable')
+        }
+        window.location.href = checkout.url
+        return
+      }
+      const result = await apiRequest<PlanInfo>('/api/plan/select', {
+        method: 'POST',
+        body: JSON.stringify({ plan: nextPlan }),
+      })
+      setPlan(result)
+      setShowUpgrade(false)
+      showToast('Plan mis \u00e0 jour.', 'success')
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : `${error}`
+      if (msg.includes('plan-storage-unavailable')) {
+        showToast('Mise \u00e0 niveau impossible (migration DB requise).', 'error')
+      } else if (msg.includes('api-401')) {
+        setShowAuth(true)
+        triggerUpgrade('Connecte-toi ou cr\u00e9e un compte pour souscrire.')
+      } else if (msg.includes('stripe-unavailable') || msg.includes('no-checkout-url')) {
+        showToast('Stripe non configur\u00e9 (cl\u00e9/price manquants ?)', 'error')
+      } else {
+        showToast('Impossible de changer de plan.', 'error')
+      }
+    } finally {
+      setPlanLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -291,12 +515,15 @@ function Home() {
           ownerType: 'anon' | 'user'
           verified: boolean
           mfaEnabled: boolean
+          plan: PlanId
         }>('/api/session')
         setAuth(session)
+        await fetchPlanInfo(session)
         await apiRequest('/api/push/purge', { method: 'POST' })
         const data = await apiRequest<{ items: PushMeta[] }>('/api/push')
         setHistory(data.items.map(toSummary))
       } catch {
+        setPlan(defaultPlan)
         setHistory([])
       }
     }
@@ -308,6 +535,21 @@ function Home() {
     window.localStorage.setItem('theme', theme)
   }, [theme])
 
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const checkout = params.get('checkout')
+    if (checkout === 'success') {
+      showToast('Paiement confirmé, mise à jour du plan…', 'success')
+      fetchPlanInfo()
+      setShowUpgrade(false)
+    } else if (checkout === 'cancel') {
+      showToast('Paiement annulé.', 'info')
+    }
+    if (checkout) {
+      window.history.replaceState({}, '', location.pathname)
+    }
+  }, [location.search])
+
   const refreshHistory = async () => {
     try {
       const session = await apiRequest<{
@@ -316,11 +558,14 @@ function Home() {
         ownerType: 'anon' | 'user'
         verified: boolean
         mfaEnabled: boolean
+        plan: PlanId
       }>('/api/session')
       setAuth(session)
+      await fetchPlanInfo(session)
       const data = await apiRequest<{ items: PushMeta[] }>('/api/push')
       setHistory(data.items.map(toSummary))
     } catch {
+      setPlan(defaultPlan)
       setHistory([])
     }
   }
@@ -347,7 +592,12 @@ function Home() {
           body: JSON.stringify({ email, password, otp: otp || undefined }),
         },
       )
-      setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
+      setAuth({
+        authenticated: true,
+        email: result.email,
+        ownerType: 'user',
+        plan: plan.plan ?? 'free',
+      })
       setPassword('')
       setOtp('')
       await refreshHistory()
@@ -390,7 +640,8 @@ function Home() {
           body: JSON.stringify({ email, password }),
         },
       )
-      setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
+      setAuth({ authenticated: true, email: result.email, ownerType: 'user', plan: 'free' })
+      setPlan(defaultPlan)
       setPassword('')
       await refreshHistory()
     } catch (error) {
@@ -411,7 +662,8 @@ function Home() {
     setAuthError('')
     try {
       await apiRequest('/api/auth/logout', { method: 'POST' })
-      setAuth({ authenticated: false, email: null, ownerType: 'anon' })
+      setAuth({ authenticated: false, email: null, ownerType: 'anon', plan: 'free' })
+      setPlan(defaultPlan)
       await refreshHistory()
     } catch {
       setAuthError('Déconnexion impossible.')
@@ -479,6 +731,11 @@ function Home() {
       showToast('Le chiffrement nécessite HTTPS ou localhost.', 'error')
       return
     }
+    if (paywallQuotaReached) {
+      setStatus('error')
+      triggerUpgrade('Quota mensuel atteint : passe en Premium ou Pro.')
+      return
+    }
     if (mode === 'text' && !secret.trim()) {
       setStatus('error')
       showToast('Message requis.', 'error')
@@ -487,6 +744,24 @@ function Home() {
     if (mode === 'file' && !file) {
       setStatus('error')
       showToast('Sélectionnez un fichier.', 'error')
+      return
+    }
+    if (mode === 'file' && file && file.size > plan.maxFileBytes) {
+      setStatus('error')
+      triggerUpgrade(
+        `Tailles supérieures à ${formatBytes(plan.maxFileBytes)} réservées aux plans supérieurs.`,
+      )
+      return
+    }
+    const selectedExpiryMs = expiry * 60 * 1000
+    if (selectedExpiryMs > plan.maxTtlMs) {
+      setStatus('error')
+      triggerUpgrade('Durées au-delà de ta limite plan (jusqu’à 7 jours en Pro).')
+      return
+    }
+    if (views > plan.maxViews) {
+      setStatus('error')
+      triggerUpgrade(`Maximum ${plan.maxViews} vues sur ton plan actuel.`)
       return
     }
 
@@ -505,10 +780,10 @@ function Home() {
           filename: file.name,
           mime: file.type || 'application/octet-stream',
           size: file.size,
-          label: label.trim() || file.name || 'Fichier',
+          label: label.trim() || file.name || generateLabel(),
           createdAtTs: now,
           expiresAtTs: expiresAt,
-          viewsLeft: Math.max(1, Math.min(20, views)),
+          viewsLeft: Math.max(1, Math.min(plan.maxViews, views)),
           cipher: encrypted.cipher,
           iv: encrypted.iv,
           salt: encrypted.salt,
@@ -518,10 +793,10 @@ function Home() {
         encrypted = await encryptSecret(secret, passphrase)
         item = {
           kind: 'text',
-          label: label.trim() || 'Secret sans titre',
+          label: label.trim() || generateLabel(),
           createdAtTs: now,
           expiresAtTs: expiresAt,
-          viewsLeft: Math.max(1, Math.min(20, views)),
+          viewsLeft: Math.max(1, Math.min(plan.maxViews, views)),
           cipher: encrypted.cipher,
           iv: encrypted.iv,
           salt: encrypted.salt,
@@ -529,11 +804,26 @@ function Home() {
         }
       }
 
-      const result = await apiRequest<{ id: string }>('/api/push', {
+      const result = await apiRequest<{
+        id: string
+        monthlyUsed?: number
+        monthlyLimit?: number | null
+        plan?: PlanId
+      }>('/api/push', {
         method: 'POST',
         body: JSON.stringify(item),
       })
       const nextLink = buildLink(result.id, encrypted.key)
+      if (typeof result.monthlyUsed === 'number') {
+        setPlan((current) => ({
+          ...current,
+          monthlyUsed: result.monthlyUsed ?? current.monthlyUsed,
+          monthlyPushLimit:
+            typeof result.monthlyLimit === 'number' ? result.monthlyLimit : current.monthlyPushLimit,
+          plan: (result.plan as PlanId) || current.plan,
+        }))
+      }
+      setLabel(generateLabel())
       setLink(nextLink)
       if (nextLink) {
         try {
@@ -550,9 +840,22 @@ function Home() {
         showToast('Lien généré.', 'success')
       }
       await refreshHistory()
-    } catch {
+    } catch (error) {
       setStatus('error')
-      showToast('Erreur de génération.', 'error')
+      if (error instanceof Error && error.message.includes('quota-exceeded')) {
+        triggerUpgrade('Quota atteint : upgrade conseillé.')
+      } else if (error instanceof Error && error.message.includes('plan-expiry-limit')) {
+        triggerUpgrade('Durées prolongées réservées aux offres supérieures.')
+      } else if (error instanceof Error && error.message.includes('plan-file-limit')) {
+        triggerUpgrade('Fichier trop volumineux pour ce plan.')
+      } else if (error instanceof Error && error.message.includes('plan-views-limit')) {
+        triggerUpgrade('Nombre de vues trop élevé pour ce plan.')
+      } else if (error instanceof Error && error.message.includes('auth-required')) {
+        setShowAuth(true)
+        triggerUpgrade('Connecte-toi pour envoyer des pushes gratuits.')
+      } else {
+        showToast('Erreur de génération.', 'error')
+      }
     }
   }
 
@@ -606,7 +909,7 @@ function Home() {
   }, [passwordLength, useUpper, useLower, useNumbers, useSymbols])
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 pb-14">
+    <div className="mx-auto flex w-full max-w-[1480px] flex-col gap-10 pb-14 px-4 sm:px-6">
       <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
           <img src={logo} alt="Nemosyne logo" className="h-10 w-10" />
@@ -645,6 +948,15 @@ function Home() {
             <span>FR</span>
             <span className="h-5 w-px bg-[var(--line)]" />
             <span>EN</span>
+          </div>
+          <div className="flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
+            <span className="font-semibold text-[var(--ink)]">{plan.label}</span>
+            <span className="h-5 w-px bg-[var(--line)]" />
+            <span>
+              {plan.monthlyPushLimit === null
+                ? 'Illimité'
+                : `${plan.monthlyUsed}/${plan.monthlyPushLimit}`}
+            </span>
           </div>
           <button
             type="button"
@@ -726,7 +1038,7 @@ function Home() {
               ) : (
                 <>
                   <p className="text-[11px] text-[var(--ink-soft)]">
-                    Mode invité (historique uniquement sur cet appareil).
+                    Compte requis pour envoyer un push, même gratuit (historique local en invité).
                   </p>
                   <input
                     value={email}
@@ -785,91 +1097,294 @@ function Home() {
         </div>
       ) : null}
 
-      
-      <section className="grid gap-6 xl:grid-cols-[1.05fr_1fr]">
-        <div className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface-elev)]/90 p-8 shadow-[var(--shadow)] backdrop-blur">
-          <div className="absolute inset-0 bg-gradient-to-br from-[var(--primary-weak)] via-[var(--surface-muted)] to-transparent" />
-          <div className="absolute -left-24 -top-24 h-56 w-56 rounded-full bg-[var(--primary-weak)] blur-3xl" />
-          <div className="absolute -right-16 bottom-0 h-48 w-48 rounded-full bg-[var(--accent)]/20 blur-3xl" />
-          <div className="relative z-10 flex flex-col gap-6">
-            <div className="flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
-                Chiffrement local
-              </span>
-              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
-                Lien unique
-              </span>
-              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
-                Auto-suppression
-              </span>
+      {showUpgrade ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+          <div className="card-elev w-full max-w-4xl rounded-2xl border border-[var(--line)]">
+            <div className="flex items-center justify-between border-b border-[var(--line)] px-5 py-3">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  Paywall doux
+                </p>
+                <p className="text-sm text-[var(--ink)]">
+                  {paywallReason ?? 'Accès complet aux quotas, audit et gestionnaire de mots de passe.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowUpgrade(false)}
+                className="text-sm text-[var(--ink-soft)]"
+                aria-label="Fermer le paywall"
+              >
+                ✕
+              </button>
             </div>
-            <div className="flex flex-col gap-3">
-              <h1 className="text-4xl font-semibold leading-[1.05] md:text-5xl">
-                Mémo chiffré, prêt en 10 secondes.
+            <div className="grid gap-4 px-5 py-4 md:grid-cols-2">
+              {(['premium', 'pro'] as PlanId[]).map((pid) => (
+                <div
+                  key={pid}
+                  className="rounded-2xl border border-[var(--line)] bg-[var(--surface)] px-4 py-4 shadow-sm"
+                >
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                        {pid === 'premium' ? 'Premium' : 'Pro'}
+                      </p>
+                      <p className="text-2xl font-semibold text-[var(--ink)]">
+                        {planPricing[pid].price}
+                      </p>
+                      <p className="text-xs text-[var(--ink-soft)]">{planPricing[pid].subtitle}</p>
+                    </div>
+                    {plan.plan === pid ? (
+                      <span className="rounded-full bg-[var(--primary-weak)] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-[var(--ink)]">
+                        Actuel
+                      </span>
+                    ) : null}
+                  </div>
+                  <ul className="mt-3 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+                    {planPricing[pid].features.map((feat) => (
+                      <li key={feat}>• {feat}</li>
+                    ))}
+                    {pid === 'pro' ? <li>• Audit complet et support prioritaire</li> : null}
+                  </ul>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectPlan(pid)}
+                    disabled={planLoading || plan.plan === pid}
+                    className={`mt-4 w-full rounded-full border px-4 py-2 text-xs uppercase tracking-[0.2em] ${
+                      plan.plan === pid
+                        ? 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)]'
+                        : 'border-[var(--primary)] bg-[var(--primary)] text-white hover:opacity-90'
+                    }`}
+                  >
+                    {plan.plan === pid ? 'Plan en cours' : `Choisir ${pid === 'premium' ? 'Premium' : 'Pro'}`}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <p className="px-5 pb-5 text-xs text-[var(--ink-soft)]">
+              Aligné sur eu.pwpush.com : Premium 19 € / mois, Pro 29 € / mois. Les pushes de mots de passe restent gratuits une fois connecté.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      
+
+      <section className="rounded-3xl border border-[var(--line)] bg-[var(--surface-muted)]/80 px-4 py-3 shadow-[var(--shadow)]">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink)]">
+            Plan {plan.label}
+          </span>
+          <span className="text-[10px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+            {planPricing[plan.plan].subtitle}
+          </span>
+          <div className="flex items-center gap-2">
+            <div className="h-2 w-32 overflow-hidden rounded-full bg-[var(--surface)]">
+              <div
+                className="h-full rounded-full bg-[var(--primary)] transition-all"
+                style={{ width: `${pushProgress}%` }}
+              />
+            </div>
+            <span className="text-[11px] font-semibold text-[var(--ink)]">
+              {plan.monthlyPushLimit === null ? 'Push illimités' : `${plan.monthlyUsed}/${plan.monthlyPushLimit}`}
+            </span>
+            <span className="text-[10px] text-[var(--ink-soft)]">Reset {formatResetDate(plan.nextResetTs)}</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {plan.plan !== 'pro' ? (
+              <button
+                type="button"
+                onClick={() => handleSelectPlan('pro')}
+                disabled={planLoading}
+                className="pill border border-[var(--primary)] bg-transparent px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--primary)] transition hover:bg-[var(--primary-weak)]"
+              >
+                Pro 29 €
+              </button>
+            ) : (
+              <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
+                Pro actif
+              </span>
+            )}
+            {plan.plan === 'free' ? (
+              <button
+                type="button"
+                onClick={() => handleSelectPlan('premium')}
+                disabled={planLoading}
+                className="pill border border-[var(--line)] bg-transparent px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--ink)] transition hover:border-[var(--primary)]"
+              >
+                Premium 19 €
+              </button>
+            ) : null}
+            {!auth.authenticated ? (
+              <button
+                type="button"
+                onClick={() => setShowAuth(true)}
+                className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink)] transition hover:border-[var(--primary)]"
+              >
+                Créer un compte
+              </button>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-[0.14em] text-[var(--ink-soft)]">
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
+            Expiration max {expiryLimitMinutes >= 1440
+              ? `${Math.round(expiryLimitMinutes / 1440)} j`
+              : `${expiryLimitMinutes} min`}
+          </span>
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
+            Vues max {plan.maxViews}
+          </span>
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
+            Fichier {formatBytes(plan.maxFileBytes)}
+          </span>
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
+            Historique {plan.historyLimit} items
+          </span>
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
+            Push gratuits (compte requis)
+          </span>
+          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
+            {plan.monthlyPushLimit === null
+              ? 'Illimité'
+              : `${remainingPushes ?? plan.monthlyPushLimit} restant(s)`}
+          </span>
+        </div>
+      </section>
+
+
+      <section className="grid gap-6 xl:grid-cols-[1.05fr_1fr]">
+        <div className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface-elev)]/94 p-8 shadow-[var(--shadow-strong)] backdrop-blur">
+          <div className="absolute inset-0 bg-gradient-to-br from-[var(--primary-weak)] via-[var(--surface-muted)] to-transparent" />
+          <div className="absolute -left-28 -top-24 h-64 w-64 rounded-full bg-[var(--primary-weak)] blur-3xl opacity-70" />
+          <div className="absolute inset-x-8 top-10 h-px bg-gradient-to-r from-transparent via-[var(--primary-weak)]/30 to-transparent" />
+          <div className="relative z-10 flex flex-col gap-7">
+            <div className="flex flex-wrap gap-2 text-[10px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
+              {['Chiffrement local', 'Zero knowledge', 'Auto-destruction'].map((tag) => (
+                <span
+                  key={tag}
+                  className="pill border border-[var(--line)] bg-transparent px-3 py-1"
+                >
+                  {tag}
+                </span>
+              ))}
+            </div>
+
+            <div className="flex flex-col gap-4">
+              <h1 className="text-4xl font-semibold leading-[1.08] text-[var(--ink)] md:text-4xl">
+                Envoyez un mot de passe sécurisé en 10 secondes.
               </h1>
-              <p className="max-w-xl text-sm text-[var(--ink-soft)]">
-                Écris ou importe, fixe l'expiration et partage le lien. Zéro texte inutile.
+              <p className="max-w-2xl text-base text-[var(--ink-soft)] leading-relaxed">
+                Plus jamais de mot de passe en clair dans vos emails. Un lien chiffré, prêt à
+                s'autodétruire après lecture, sans compte obligatoire pour le destinataire.
               </p>
             </div>
+
             <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/90 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]">
+                <p className="text-base font-semibold text-[var(--ink)]">Chiffrement local</p>
+                <p className="text-sm text-[var(--ink-soft)]">Clé gardée dans l'URL, jamais stockée côté serveur.</p>
+              </div>
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/90 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]">
+                <p className="text-base font-semibold text-[var(--ink)]">Partage immédiat</p>
+                <p className="text-sm text-[var(--ink-soft)]">Lien utilisable en 10 secondes, lecture unique optionnelle.</p>
+              </div>
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/90 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]">
+                <p className="text-base font-semibold text-[var(--ink)]">Auto-destruction</p>
+                <p className="text-sm text-[var(--ink-soft)]">Expiration, nombre de vues limité, suppression automatique.</p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={focusComposer}
+                className="group relative overflow-hidden rounded-xl bg-[var(--primary)] px-6 py-3 text-lg font-semibold text-white shadow-[0_12px_26px_rgba(0,0,0,0.16)] transition duration-200 hover:-translate-y-0.5 hover:shadow-[0_18px_34px_rgba(0,0,0,0.18)] focus-visible:shadow-[var(--ring)]"
+              >
+                Envoyer un mot de passe
+                <span className="pointer-events-none absolute inset-0 opacity-0 transition duration-200 group-hover:opacity-20" style={{ background: 'linear-gradient(120deg, transparent, rgba(255,255,255,0.22), transparent)' }} />
+              </button>
+              <button
+                type="button"
+                onClick={link ? handleCopy : () => {
+                  if (!generatedPassword) generatePassword()
+                  handleCopyGenerated()
+                }}
+                className="rounded-full border border-[var(--line)] px-4 py-2 text-sm text-[var(--ink-soft)] transition duration-150 hover:border-[var(--primary)]"
+              >
+                {link ? 'Copier le lien actuel' : 'Générer un mot de passe'}
+              </button>
+              <span className="text-sm text-[var(--ink-soft)]">Plus jamais de mot de passe en clair.</span>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3">
+              {[
+                { title: '1. Créer un mémo', desc: 'Collez le secret ou ajoutez un fichier.' },
+                { title: '2. Configurer', desc: 'Expiration, vues, passphrase optionnelle.' },
+                { title: '3. Partager', desc: 'Lien unique qui s’autodétruit après lecture.' },
+              ].map((step, index) => (
+                <div
+                  key={step.title}
+                  className="flex items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface)]/85 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]"
+                >
+                  <span className="mt-1 h-7 w-7 rounded-full bg-[var(--primary-weak)] text-center text-sm font-semibold text-[var(--primary-strong)]">
+                    {index + 1}
+                  </span>
+                  <div className="flex flex-col">
+                    <p className="text-sm font-semibold text-[var(--ink)]">{step.title}</p>
+                    <p className="text-xs text-[var(--ink-soft)]">{step.desc}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 shadow-sm">
                 <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Mode</p>
                 <p className="text-lg font-semibold text-[var(--ink)]">
                   {mode === 'text' ? 'Texte' : 'Fichier'}
                 </p>
               </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 shadow-sm">
                 <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Expiration</p>
                 <p className="text-lg font-semibold text-[var(--ink)]">{expiresAtLabel}</p>
               </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 shadow-sm">
                 <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Vues</p>
                 <p className="text-lg font-semibold text-[var(--ink)]">{views} max</p>
               </div>
-            </div>
-            <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
-              {['Écrire ou importer', 'Limiter + protéger', 'Partager le lien'].map((step) => (
-                <span
-                  key={step}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1"
-                >
-                  {step}
-                </span>
-              ))}
-            </div>
-            <div className="flex flex-wrap gap-3">
-              <button
-                type="button"
-                onClick={focusComposer}
-                className="pill border border-[var(--primary)] bg-[var(--primary)] px-5 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-              >
-                Commencer un mémo
-              </button>
-              {link ? (
-                <button
-                  type="button"
-                  onClick={handleCopy}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
-                >
-                  Copier le lien actuel
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!generatedPassword) generatePassword()
-                    handleCopyGenerated()
-                  }}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
-                >
-                  Générer un mot de passe
-                </button>
-              )}
             </div>
           </div>
         </div>
 
         <section id="composer" className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow-strong)] backdrop-blur">
+          {paywallQuotaReached ? (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-[var(--surface)]/92 backdrop-blur">
+              <p className="text-sm font-semibold text-[var(--ink)]">
+                Quota atteint sur ton plan actuel.
+              </p>
+              <p className="text-xs text-[var(--ink-soft)]">
+                Upgrade pour continuer à pousser sans limite.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleSelectPlan('premium')}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                >
+                  Passer en Premium
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSelectPlan('pro')}
+                  className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+                >
+                  Passer en Pro
+                </button>
+              </div>
+            </div>
+          ) : null}
           <div className="flex items-center justify-between border-b border-[var(--line)] px-6 py-4">
             <div>
               <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
@@ -920,10 +1435,10 @@ function Home() {
                   onChange={(event) => {
                     const selected = event.target.files?.[0]
                     if (!selected) return
-                    const maxBytes = 5 * 1024 * 1024
+                    const maxBytes = plan.maxFileBytes
                     if (selected.size > maxBytes) {
                       setFile(null)
-                      setFileError('Fichier trop volumineux (max 5 MB).')
+                      setFileError(`Fichier trop volumineux (max ${formatBytes(maxBytes)}).`)
                       setMode('file')
                       return
                     }
@@ -945,7 +1460,7 @@ function Home() {
                   <>
                     Importer un fichier
                     <span className="mt-1 text-[10px] text-[var(--ink-soft)]">
-                      Taille max : 5 MB
+                      Taille max : {formatBytes(plan.maxFileBytes)}
                     </span>
                   </>
                 )}
@@ -953,9 +1468,14 @@ function Home() {
             </div>
 
             <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-4 py-3">
-              <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Message
-              </label>
+              <div className="flex items-center justify-between gap-3">
+                <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  Message
+                </label>
+                <span className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-[10px] text-[var(--ink-soft)]">
+                  {label}
+                </span>
+              </div>
               <textarea
                 id="memo-area"
                 rows={4}
@@ -979,20 +1499,35 @@ function Home() {
                   Expiration
                 </p>
                 <div className="flex flex-wrap gap-2">
-                  {presets.map((preset) => (
-                    <button
-                      key={preset.label}
-                      type="button"
-                      onClick={() => setExpiry(preset.minutes)}
-                      className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
-                        expiry === preset.minutes
-                          ?'border-[var(--primary)] bg-[var(--primary)] text-white'
-                          : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
-                      }`}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
+                  {presets.map((preset) => {
+                    const locked =
+                      preset.minPlan && planOrder[plan.plan] < planOrder[preset.minPlan]
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          if (locked) {
+                            triggerUpgrade(
+                              `Durée ${preset.label} disponible en ${preset.minPlan === 'pro' ? 'Pro' : 'Premium'}.`,
+                            )
+                            return
+                          }
+                          setExpiry(preset.minutes)
+                        }}
+                        className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
+                          expiry === preset.minutes
+                            ?'border-[var(--primary)] bg-[var(--primary)] text-white'
+                            : locked
+                                ? 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] opacity-50'
+                                : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
+                        }`}
+                      >
+                        {preset.label}
+                        {locked ? ' · ' + preset.minPlan?.toUpperCase() : ''}
+                      </button>
+                    )
+                  })}
                 </div>
               </div>
               <div className="flex flex-col gap-3">
@@ -1002,11 +1537,15 @@ function Home() {
                 <input
                   type="number"
                   min={1}
-                  max={20}
+                  max={plan.maxViews}
                   value={views}
-                  onChange={(event) => setViews(Number(event.target.value))}
+                  onChange={(event) => {
+                    const next = Number(event.target.value)
+                    setViews(Math.min(plan.maxViews, Math.max(1, next)))
+                  }}
                   className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
                 />
+                <p className="text-xs text-[var(--ink-soft)]">Max {plan.maxViews} vues selon le plan.</p>
               </div>
             </div>
 
@@ -1216,6 +1755,75 @@ function Home() {
         </div>
       </section>
 
+      <section className="grid gap-5 lg:grid-cols-2">
+        <div className="card rounded-2xl px-5 py-5">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+                Nouveau coffre-fort natif
+              </p>
+              <p className="text-base font-semibold text-[var(--ink)]">
+                Interface de coffre moderne, 100% Nemosyne
+              </p>
+              <p className="text-xs text-[var(--ink-soft)]">
+                Multi-colonnes, TOTP live, passkeys, mode voyage, générateur intégré.
+              </p>
+            </div>
+            <span className="pill border border-[var(--primary)] bg-[var(--primary-weak)] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-[var(--ink)]">
+              Beta
+            </span>
+          </div>
+          <ul className="mt-3 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+            <li>Chiffrement AES-GCM + dérivation PBKDF2 côté client, sans dépendance externe.</li>
+            <li>Types : connexions, cartes, identités, notes, Wi‑Fi, SSH, API, passkeys.</li>
+            <li>Watchtower natif : faibles/recyclés, expirations, périmètre voyage.</li>
+          </ul>
+          <Link
+            to="/vault"
+            className="mt-4 inline-flex w-fit items-center justify-center rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+          >
+            Ouvrir la nouvelle interface
+          </Link>
+        </div>
+
+        <div className="card rounded-2xl px-5 py-5">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+                Pour les équipes et voyages
+              </p>
+              <p className="text-base font-semibold text-[var(--ink)]">Partage, audit, mode voyage</p>
+              <p className="text-xs text-[var(--ink-soft)]">
+                Prépare la synchro multi-appareils et l’API d’automatisation.
+              </p>
+            </div>
+            <span className="pill border border-[var(--primary)] bg-[var(--surface-muted)] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+              R&D
+            </span>
+          </div>
+          <ul className="mt-3 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+            <li>Mode voyage : masque instantanément les éléments non marqués « safe ».</li>
+            <li>Journal local + historique par item (rotations, copies, révocations).</li>
+            <li>API/Bot à venir pour provisionner les vaults d’équipe.</li>
+          </ul>
+          <div className="mt-4 flex gap-2">
+            <Link
+              to="/vault"
+              className="rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+            >
+              Tester le coffre
+            </Link>
+            <button
+              type="button"
+              onClick={() => triggerUpgrade('Roadmap coffre natif')}
+              className="rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+            >
+              Voir la roadmap
+            </button>
+          </div>
+        </div>
+      </section>
+
 
       {toast ? (
         <div className="fixed bottom-6 right-6 z-50">
@@ -1363,7 +1971,7 @@ function PushView() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-col gap-6">
+    <div className="mx-auto flex w-full max-w-[1200px] flex-col gap-6 px-4 sm:px-6">
       <header className="flex flex-col gap-3">
         <button
           type="button"
@@ -1533,7 +2141,7 @@ function PushView() {
 
 function NotFound() {
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-[1100px] flex-col gap-4 px-4 sm:px-6">
       <h1 className="text-3xl font-semibold">Page introuvable</h1>
       <Link to="/" className="text-sm text-[var(--primary)]">
         Retour à l’accueil
@@ -1564,7 +2172,7 @@ function VerifyEmail() {
   }, [location.search])
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-[1100px] flex-col gap-4 px-4 sm:px-6">
       <h1 className="text-3xl font-semibold">Vérification email</h1>
       {status === 'loading' ?(
         <p className="text-sm text-[var(--ink-soft)]">Vérification en cours…</p>
@@ -1594,7 +2202,7 @@ function LegalPage({
   children: React.ReactNode
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-[1200px] flex-col gap-4 px-4 sm:px-6">
       <h1 className="text-3xl font-semibold">{title}</h1>
       <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-6 py-5 text-sm text-[var(--ink-soft)]">
         {children}
@@ -1666,7 +2274,9 @@ function FeaturesPage() {
     <LegalPage title="Caractéristiques">
       <p>Chiffrement côté client (AES-GCM) avant stockage.</p>
       <p className="mt-3">Liens secrets à usage limité avec expiration.</p>
-      <p className="mt-3">Partage de fichiers chiffrés jusqu’à 5 MB.</p>
+      <p className="mt-3">
+        Partage de fichiers chiffrés : 2 MB (Gratuit), 8 MB (Premium), 15 MB (Pro).
+      </p>
       <p className="mt-3">MFA TOTP, vérification email et sessions sécurisées.</p>
       <p className="mt-3">Historique des pushes et tableau de bord.</p>
     </LegalPage>
@@ -1674,55 +2284,91 @@ function FeaturesPage() {
 }
 
 function PricingPage() {
+  const plans = [
+    {
+      id: 'free',
+      name: 'Gratuit',
+      price: '0 €',
+      subtitle: 'Compte requis, pushes gratuits',
+      accent: false,
+      cta: 'Créer un compte',
+      features: [
+        'Push de mots de passe gratuits (10 / mois)',
+        'Expiration jusqu’à 24h',
+        'Fichiers chiffrés jusqu’à 2 MB',
+        'Historique 5 éléments',
+      ],
+    },
+    {
+      id: 'premium',
+      name: 'Premium',
+      price: '19 € / mois',
+      subtitle: 'Aligné sur eu.pwpush.com (individuel)',
+      accent: true,
+      cta: 'Choisir Premium',
+      features: [
+        'Push illimités',
+        'Expiration jusqu’à 72h',
+        'Fichiers 8 MB + API & branding léger',
+        'Logs d’accès et notifications',
+      ],
+    },
+    {
+      id: 'pro',
+      name: 'Pro',
+      price: '29 € / mois',
+      subtitle: 'Équipes / audit avancé',
+      accent: false,
+      cta: 'Passer en Pro',
+      features: [
+        'Tout Premium + expiration 7 jours',
+        'Jusqu’à 20 vues par push',
+        'Audit complet, blocage IP, MFA',
+        'Gestionnaire de mots de passe natif intégré',
+      ],
+    },
+  ]
+
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
+    <div className="mx-auto flex w-full max-w-[1300px] flex-col gap-6 px-4 sm:px-6">
       <h1 className="text-3xl font-semibold">Tarifs</h1>
       <p className="text-sm text-[var(--ink-soft)]">
-        Des plans simples pour sécuriser et partager vos secrets.
+        Grille alignée sur <span className="font-semibold">eu.pwpush.com/pricing</span> : les
+        pushs de mots de passe restent gratuits avec compte.
       </p>
       <div className="grid gap-5 md:grid-cols-3">
-        <div className="card-elev px-5 py-6">
-          <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">Starter</p>
-          <p className="mt-2 text-2xl font-semibold">0 €</p>
-          <p className="text-xs text-[var(--ink-soft)]">Pour essayer</p>
-          <ul className="mt-4 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
-            <li>Jusqu’à 10 pushes / mois</li>
-            <li>Expiration max 24h</li>
-            <li>1 utilisateur</li>
-          </ul>
-          <button className="mt-5 w-full rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-            Commencer
-          </button>
-        </div>
-        <div className="card-elev px-5 py-6 border border-[var(--primary)]">
-          <p className="text-xs uppercase tracking-[0.2em] text-[var(--primary)]">Pro</p>
-          <p className="mt-2 text-2xl font-semibold">9 € / mois</p>
-          <p className="text-xs text-[var(--ink-soft)]">Idéal pour les indépendants</p>
-          <ul className="mt-4 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
-            <li>Pushes illimités</li>
-            <li>Expiration jusqu’à 7 jours</li>
-            <li>Historique complet</li>
-            <li>MFA & audit d’accès</li>
-          </ul>
-          <button className="mt-5 w-full rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white">
-            Choisir Pro
-          </button>
-        </div>
-        <div className="card-elev px-5 py-6">
-          <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">Business</p>
-          <p className="mt-2 text-2xl font-semibold">25 € / mois</p>
-          <p className="text-xs text-[var(--ink-soft)]">Équipes et PME</p>
-          <ul className="mt-4 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
-            <li>Tout Pro</li>
-            <li>Jusqu’à 20 utilisateurs</li>
-            <li>Rôles & permissions</li>
-            <li>Support prioritaire</li>
-          </ul>
-          <button className="mt-5 w-full rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-            Contacter
-          </button>
-        </div>
+        {plans.map((planItem) => (
+          <div
+            key={planItem.id}
+            className={`card-elev px-5 py-6 ${planItem.accent ? 'border border-[var(--primary)]' : ''}`}
+          >
+            <p
+              className={`text-xs uppercase tracking-[0.2em] ${planItem.accent ? 'text-[var(--primary)]' : 'text-[var(--ink-soft)]'}`}
+            >
+              {planItem.name}
+            </p>
+            <p className="mt-2 text-2xl font-semibold">{planItem.price}</p>
+            <p className="text-xs text-[var(--ink-soft)]">{planItem.subtitle}</p>
+            <ul className="mt-4 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+              {planItem.features.map((feat) => (
+                <li key={feat}>{feat}</li>
+              ))}
+            </ul>
+            <button
+              className={`mt-5 w-full rounded-full px-4 py-2 text-xs uppercase tracking-[0.2em] ${
+                planItem.accent
+                  ? 'border border-[var(--primary)] bg-[var(--primary)] text-white'
+                  : 'border border-[var(--line)] text-[var(--ink-soft)]'
+              }`}
+            >
+              {planItem.cta}
+            </button>
+          </div>
+        ))}
       </div>
+      <p className="text-xs text-[var(--ink-soft)]">
+        Premium pour particuliers (19 € / mois) et Pro pour équipes (29 € / mois) – mêmes paliers que eu.pwpush.com.
+      </p>
     </div>
   )
 }
@@ -1730,10 +2376,12 @@ function PricingPage() {
 function ApiDocsPage() {
   return (
     <LegalPage title="Documentation API">
-      <p>Créer un push: POST /api/push</p>
+      <p>Créer un push (auth requis): POST /api/push</p>
       <p className="mt-3">Récupérer les métadonnées: GET /api/push/:id/meta</p>
       <p className="mt-3">Révéler un secret: POST /api/push/:id/reveal</p>
       <p className="mt-3">Session: GET /api/session</p>
+      <p className="mt-3">Plan & quotas: GET /api/plan</p>
+      <p className="mt-3">Changer de plan (Premium/Pro): POST /api/plan/select</p>
       <p className="mt-3">Authentification: /api/auth/*</p>
     </LegalPage>
   )
@@ -1814,6 +2462,7 @@ function App() {
         <Route path="/whats-new" element={<WhatsNewPage />} />
         <Route path="/tools/passwords" element={<PasswordGeneratorPage />} />
         <Route path="/tools/keys" element={<KeyGeneratorPage />} />
+        <Route path="/vault" element={<VaultPage />} />
         <Route path="/best-practices" element={<BestPracticesPage />} />
         <Route path="/faq" element={<FaqPage />} />
         <Route path="/privacy" element={<PrivacyPolicy />} />
