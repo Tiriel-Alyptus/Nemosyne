@@ -47,6 +47,9 @@ const pool = new Pool({
   max: 10,
 })
 
+// In production on managed DBs, avoid running DDL as non-owner.
+const shouldMigrate = process.env.RUN_MIGRATIONS === 'true'
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -91,10 +94,12 @@ async function initDb() {
   `)
 }
 
-const dbReady = initDb().catch((error) => {
-  console.error('Failed to initialize database', error)
-  throw error
-})
+const dbReady = shouldMigrate
+  ? initDb().catch((error) => {
+      console.error('Failed to initialize database', error)
+      throw error
+    })
+  : Promise.resolve()
 
 const smtpHost = process.env.SMTP_HOST || 'smtp.gmail.com'
 const smtpPort = Number(process.env.SMTP_PORT || 465)
