@@ -1,4 +1,5 @@
-import 'dotenv/config'
+import fs from 'fs'
+import dotenv from 'dotenv'
 import express from 'express'
 import path from 'path'
 import cron from 'node-cron'
@@ -10,6 +11,13 @@ import nodemailer from 'nodemailer'
 import speakeasy from 'speakeasy'
 import qrcode from 'qrcode'
 import { Pool } from 'pg'
+
+// Load env vars from .env, then let .env.local override if present (mirrors CRA-style behavior).
+dotenv.config()
+const localEnvPath = path.resolve(process.cwd(), '.env.local')
+if (fs.existsSync(localEnvPath)) {
+  dotenv.config({ path: localEnvPath, override: true })
+}
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -24,7 +32,8 @@ const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) {
   throw new Error('DATABASE_URL is required')
 }
-const dbSslMode = process.env.DB_SSL_MODE || 'verify'
+// Default to a relaxed SSL mode in development to play nicely with corp proxies / self-signed MITM certs.
+const dbSslMode = process.env.DB_SSL_MODE || (isProd ? 'verify' : 'relaxed')
 const dbSsl =
   process.env.DB_SSL === 'false'
     ? false

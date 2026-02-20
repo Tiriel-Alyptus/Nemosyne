@@ -604,51 +604,52 @@ function Home() {
       <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
           <img src={logo} alt="Nemosyne logo" className="h-10 w-10" />
-          <span className="text-3xl font-semibold tracking-tight">Nemosyne.</span>
-          <span className="pill bg-[var(--primary-weak)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]">
-            Secure Memo
-          </span>
+          <div className="flex flex-col leading-tight">
+            <span className="text-3xl font-semibold tracking-tight">Nemosyne</span>
+            <span className="text-[11px] uppercase tracking-[0.28em] text-[var(--ink-soft)]">
+              Mémos chiffrés
+            </span>
+          </div>
         </div>
 
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-end lg:gap-4 lg:flex-nowrap">
-          <div className="flex items-center gap-3 lg:justify-end">
-            <div className="flex items-center gap-1 rounded-full bg-[var(--surface-muted)] p-1">
-              <button
-                type="button"
-                onClick={() => setTheme('dark')}
-                className={`h-5 w-5 rounded-full border ${
-                  theme === 'dark'
-                    ?'border-[var(--primary)] bg-[var(--primary)]'
-                    : 'border-[var(--line)] bg-[var(--surface)]'
-                }`}
-                aria-label="Mode sombre"
-              />
-              <button
-                type="button"
-                onClick={() => setTheme('light')}
-                className={`h-5 w-5 rounded-full border ${
-                  theme === 'light'
-                    ?'border-[var(--primary)] bg-[var(--primary)]'
-                    : 'border-[var(--line)] bg-[var(--surface)]'
-                }`}
-                aria-label="Mode clair"
-              />
-            </div>
-            <div className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
-              <span className="rounded bg-[var(--surface-muted)] px-2 py-1">FR</span>
-              <span className="rounded bg-[var(--surface-muted)] px-2 py-1">EN</span>
-            </div>
+        <div className="flex flex-wrap items-center gap-3 lg:gap-4">
+          <div className="flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] p-1">
+            <button
+              type="button"
+              onClick={() => setTheme('dark')}
+              className={`h-6 w-6 rounded-full border ${
+                theme === 'dark'
+                  ?'border-[var(--primary)] bg-[var(--primary)]'
+                  : 'border-[var(--line)] bg-[var(--surface)]'
+              }`}
+              aria-label="Mode sombre"
+            />
+            <button
+              type="button"
+              onClick={() => setTheme('light')}
+              className={`h-6 w-6 rounded-full border ${
+                theme === 'light'
+                  ?'border-[var(--primary)] bg-[var(--primary)]'
+                  : 'border-[var(--line)] bg-[var(--surface)]'
+              }`}
+              aria-label="Mode clair"
+            />
           </div>
-
+          <div className="flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
+            <span>FR</span>
+            <span className="h-5 w-px bg-[var(--line)]" />
+            <span>EN</span>
+          </div>
           <button
             type="button"
             onClick={() => setShowAuth(true)}
             className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
           >
-            Accès Gestionnaire de mot de passe
+            Espace compte
           </button>
         </div>
       </header>
+
 
       {showAuth ?(
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
@@ -778,112 +779,113 @@ function Home() {
         </div>
       ) : null}
 
-      <main className="grid items-center gap-10 lg:grid-cols-[1fr_1.2fr]">
-        <section className="flex flex-col gap-5">
-          <h1 className="text-4xl font-semibold uppercase tracking-tight md:text-5xl">
-            Crée ton Mémo chiffré
-          </h1>
-          <p className="max-w-md text-sm text-[var(--ink-soft)]">
-            En cliquant sur le bouton, vous obtenez un lien vers le Mémo. Le Mémo est
-            stocké de manière chiffrée. Après autodéstruction, il ne peut être récupéré.
-          </p>
-          <div className="grid gap-3 text-sm text-[var(--ink-soft)]">
-            <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
-              Le contenu est crypté avant le stockage et n'est disponible que pour ceux
-              disposant du lien secret.
+      
+      <section className="grid gap-6 xl:grid-cols-[1.05fr_1fr]">
+        <div className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface-elev)]/90 p-8 shadow-[var(--shadow)] backdrop-blur">
+          <div className="absolute inset-0 bg-gradient-to-br from-[var(--primary-weak)] via-[var(--surface-muted)] to-transparent" />
+          <div className="absolute -left-24 -top-24 h-56 w-56 rounded-full bg-[var(--primary-weak)] blur-3xl" />
+          <div className="absolute -right-16 bottom-0 h-48 w-48 rounded-full bg-[var(--accent)]/20 blur-3xl" />
+          <div className="relative z-10 flex flex-col gap-6">
+            <div className="flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
+                Chiffrement local
+              </span>
+              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
+                Lien unique
+              </span>
+              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
+                Auto-suppression
+              </span>
             </div>
-            <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
-              Une fois expiré, tous les contenus et fichiers de la publication sont supprimés
-              immédiatement et entièrement.
-            </div>
-            <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
-              Toutes les activités liées à votre push sont enregistrées et accessibles dans
-              votre tableau de bord.
-            </div>
-          </div>
-          <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
-            <div className="flex items-center justify-between">
-              <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Générateur de mot de passe
+            <div className="flex flex-col gap-3">
+              <h1 className="text-4xl font-semibold leading-[1.05] md:text-5xl">
+                Mémo chiffré, prêt en 10 secondes.
+              </h1>
+              <p className="max-w-xl text-sm text-[var(--ink-soft)]">
+                Écris ou importe, fixe l'expiration et partage le lien. Zéro texte inutile.
               </p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Mode</p>
+                <p className="text-lg font-semibold text-[var(--ink)]">
+                  {mode === 'text' ? 'Texte' : 'Fichier'}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Expiration</p>
+                <p className="text-lg font-semibold text-[var(--ink)]">{expiresAtLabel}</p>
+              </div>
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Vues</p>
+                <p className="text-lg font-semibold text-[var(--ink)]">{views} max</p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
+              {['Écrire ou importer', 'Limiter + protéger', 'Partager le lien'].map((step) => (
+                <span
+                  key={step}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1"
+                >
+                  {step}
+                </span>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-3">
               <button
                 type="button"
-                onClick={generatePassword}
-                className="pill border border-[var(--line)] bg-[var(--primary-weak)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
+                onClick={focusComposer}
+                className="pill border border-[var(--primary)] bg-[var(--primary)] px-5 py-2 text-sm font-semibold text-white transition hover:opacity-90"
               >
-                Générer
+                Commencer un mémo
               </button>
-            </div>
-            <div className="mt-3 flex flex-col gap-3">
-              <input
-                value={generatedPassword}
-                readOnly
-                className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                placeholder="Mot de passe généré"
-              />
-              <div className="flex items-center gap-3">
-                <label className="text-xs text-[var(--ink-soft)]">Longueur</label>
-                <input
-                  type="range"
-                  min={12}
-                  max={48}
-                  value={passwordLength}
-                  onChange={(event) => setPasswordLength(Number(event.target.value))}
-                  className="flex-1"
-                />
-                <span className="text-xs text-[var(--ink-soft)]">{passwordLength}</span>
+              {link ? (
                 <button
                   type="button"
-                  onClick={handleCopyGenerated}
-                  className="pill border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                  onClick={handleCopy}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
                 >
-                  Copier
+                  Copier le lien actuel
                 </button>
-              </div>
-              <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={useUpper}
-                    onChange={(event) => setUseUpper(event.target.checked)}
-                  />
-                  Majuscules
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={useLower}
-                    onChange={(event) => setUseLower(event.target.checked)}
-                  />
-                  Minuscules
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={useNumbers}
-                    onChange={(event) => setUseNumbers(event.target.checked)}
-                  />
-                  Chiffres
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={useSymbols}
-                    onChange={(event) => setUseSymbols(event.target.checked)}
-                  />
-                  Symboles
-                </label>
-              </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!generatedPassword) generatePassword()
+                    handleCopyGenerated()
+                  }}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
+                >
+                  Générer un mot de passe
+                </button>
+              )}
             </div>
           </div>
-        </section>
+        </div>
 
-        <section className="card-elev rounded-2xl border border-[var(--line)]">
-          <div className="rounded-t-2xl bg-[var(--primary)] px-4 py-3 text-center text-sm font-semibold text-white">
-            Envoie un Mémo.
+        <section id="composer" className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow-strong)] backdrop-blur">
+          <div className="flex items-center justify-between border-b border-[var(--line)] px-6 py-4">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+                Composer
+              </p>
+              <p className="text-base font-semibold text-[var(--ink)]">Mémo sécurisé</p>
+            </div>
+            <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
+              {status === 'working'
+                ? 'Chiffrement…'
+                : status === 'ready' || status === 'autocopied'
+                  ? 'Lien prêt'
+                  : status === 'copied'
+                    ? 'Copié'
+                    : status === 'error'
+                      ? 'À vérifier'
+                      : 'En attente'}
+            </span>
           </div>
-          <div className="flex flex-col gap-4 p-6">
-            <div className="grid gap-4 md:grid-cols-2">
+
+          <div className="flex flex-col gap-5 p-6">
+            <div className="flex flex-wrap gap-3">
               <button
                 type="button"
                 onClick={() => {
@@ -891,19 +893,19 @@ function Home() {
                   setFile(null)
                   setFileError('')
                 }}
-                className={`rounded-lg border px-4 py-6 text-sm font-semibold transition ${
+                className={`rounded-xl border px-4 py-3 text-sm font-semibold transition ${
                   mode === 'text'
                     ?'border-[var(--primary)] bg-[var(--primary)] text-white'
-                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)]'
+                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
                 }`}
               >
                 Écrire un message
               </button>
               <label
-                className={`flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-4 py-6 text-center text-xs transition ${
+                className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-3 text-center text-xs transition ${
                   mode === 'file'
                     ?'border-[var(--primary)] bg-[var(--primary-weak)] text-[var(--primary)]'
-                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)]'
+                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
                 }`}
               >
                 <input
@@ -937,18 +939,19 @@ function Home() {
                   <>
                     Importer un fichier
                     <span className="mt-1 text-[10px] text-[var(--ink-soft)]">
-                      Taille maximale : 5 MB
+                      Taille max : 5 MB
                     </span>
                   </>
                 )}
               </label>
             </div>
 
-            <div className="flex flex-col gap-2">
-              <label className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Message chiffré
+            <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-4 py-3">
+              <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                Message
               </label>
               <textarea
+                id="memo-area"
                 rows={4}
                 value={secret}
                 disabled={mode === 'file'}
@@ -956,7 +959,7 @@ function Home() {
                   setSecret(event.target.value)
                   setStatus('idle')
                 }}
-                placeholder="Tapez votre message..."
+                placeholder="Tape ton secret ou colle-le ici."
                 className="w-full resize-none rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-60"
               />
               {fileError ?(
@@ -964,18 +967,18 @@ function Home() {
               ) : null}
             </div>
 
-            <div className="grid gap-3 md:grid-cols-3">
-              <div className="flex flex-col gap-2 md:col-span-2">
-                <label className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Date d'expiration
-                </label>
+            <div className="grid gap-4 lg:grid-cols-3">
+              <div className="flex flex-col gap-3 lg:col-span-2">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  Expiration
+                </p>
                 <div className="flex flex-wrap gap-2">
                   {presets.map((preset) => (
                     <button
                       key={preset.label}
                       type="button"
                       onClick={() => setExpiry(preset.minutes)}
-                      className={`rounded-md border px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
+                      className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
                         expiry === preset.minutes
                           ?'border-[var(--primary)] bg-[var(--primary)] text-white'
                           : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
@@ -986,10 +989,10 @@ function Home() {
                   ))}
                 </div>
               </div>
-              <div className="flex flex-col gap-2">
-                <label className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+              <div className="flex flex-col gap-3">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
                   Vues max
-                </label>
+                </p>
                 <input
                   type="number"
                   min={1}
@@ -1001,87 +1004,204 @@ function Home() {
               </div>
             </div>
 
-            <div className="flex flex-col gap-2">
-              <label className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Passphrase (optionnelle)
-              </label>
-              <input
-                value={passphrase}
-                onChange={(event) => setPassphrase(event.target.value)}
-                className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
-                placeholder="Ex: mot doux"
-                type="password"
-              />
+            <div className="grid gap-3 lg:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  Passphrase (option)
+                </p>
+                <input
+                  value={passphrase}
+                  onChange={(event) => setPassphrase(event.target.value)}
+                  className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
+                  placeholder="Ajoute une passphrase"
+                  type="password"
+                />
+              </div>
+              <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm text-[var(--ink-soft)]">
+                <p className="text-[11px] uppercase tracking-[0.2em]">Accès</p>
+                <p className="leading-relaxed">
+                  Lien + clé dans l'URL. Ajoute une passphrase pour une double barrière.
+                </p>
+              </div>
             </div>
 
-            <button
-              type="button"
-              onClick={handleGenerate}
-              className="mx-auto rounded-md border border-[var(--primary)] bg-[var(--primary-weak)] px-6 py-2 text-sm font-semibold text-[var(--primary)] transition hover:bg-[var(--primary)] hover:text-white"
-            >
-              {status === 'working' ?'Chiffrement…' : 'Créer un Mémo'}
-            </button>
-
-            {status === 'error' ?(
-              <p className="text-sm text-[var(--primary)]">
-                Vérifiez le secret ou réessayez.
-              </p>
-            ) : null}
-
-            <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm">
-              {link ? (
-                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                  <span className="break-all text-[var(--ink)]">{link}</span>
-                  <button
-                    type="button"
-                    onClick={handleCopy}
-                    className="w-fit rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                  >
-                    {status === 'copied' ? 'Copié' : 'Copier'}
-                  </button>
-                </div>
-              ) : (
-                <span className="text-[var(--ink-soft)]">
-                  Le lien apparaîtra ici après génération.
-                </span>
-              )}
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleGenerate}
+                  className="rounded-md bg-[var(--primary)] px-6 py-2 text-sm font-semibold text-white transition hover:opacity-90"
+                >
+                  {status === 'working' ?'Chiffrement…' : 'Générer le lien'}
+                </button>
+                {status === 'error' ?(
+                  <p className="text-sm text-[var(--primary)]">
+                    Vérifie les champs ou réessaie.
+                  </p>
+                ) : null}
+              </div>
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm">
+                {link ? (
+                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <span className="break-all text-[var(--ink)]">{link}</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleCopy}
+                        className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                      >
+                        Copier
+                      </button>
+                      <span className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                        {status === 'copied'
+                          ? 'Copié'
+                          : status === 'autocopied'
+                            ? 'Auto-copié'
+                            : 'Prêt'}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <span className="text-[var(--ink-soft)]">
+                    Le lien apparaît ici après génération.
+                  </span>
+                )}
+              </div>
             </div>
-            {status === 'autocopied' ?(
-              <span className="text-xs text-[var(--primary)]">
-                Lien copié automatiquement.
-              </span>
-            ) : null}
           </div>
         </section>
-      </main>
+      </section>
 
-      <section className="card rounded-2xl px-5 py-4">
-        <h3 className="text-sm font-semibold uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-          Derniers pushes
-        </h3>
-        <div className="mt-3 flex flex-col gap-2">
-          {history.length === 0 ?(
-            <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)]">
-              Aucun push pour le moment.
+      <section className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
+        <div className="card rounded-2xl px-5 py-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+                Historique
+              </p>
+              <p className="text-base font-semibold text-[var(--ink)]">Derniers mémos</p>
             </div>
-          ) : (
-            history.map((item) => (
-              <Link
-                key={item.id}
-                to={`/push/${item.id}`}
-                className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink)]"
-              >
-                <span>{item.label} • {item.viewsLeft} vues</span>
-                {!item.requiresPassphrase ?(
-                  <span className="ml-2 text-xs text-[var(--ink-soft)]">
-                    (clé URL requise)
-                  </span>
-                ) : null}
-              </Link>
-            ))
-          )}
+            <button
+              type="button"
+              onClick={refreshHistory}
+              className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+            >
+              Rafraîchir
+            </button>
+          </div>
+          <div className="mt-3 flex flex-col gap-2">
+            {history.length === 0 ?(
+              <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)]">
+                Rien pour l'instant.
+              </div>
+            ) : (
+              history.map((item) => (
+                <Link
+                  key={item.id}
+                  to={`/push/${item.id}`}
+                  className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 transition hover:border-[var(--primary)]"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-[var(--ink)]">{item.label}</p>
+                      <p className="text-xs text-[var(--ink-soft)]">
+                        Expire {item.expiresAtText} • {item.viewsLeft} vues restantes
+                      </p>
+                    </div>
+                    <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                      {item.requiresPassphrase ? 'Passphrase' : 'Clé URL'}
+                    </span>
+                  </div>
+                </Link>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="card rounded-2xl px-5 py-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+                Mot de passe
+              </p>
+              <p className="text-base font-semibold text-[var(--ink)]">Générateur express</p>
+            </div>
+            <button
+              type="button"
+              onClick={generatePassword}
+              className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+            >
+              Nouveau
+            </button>
+          </div>
+
+          <div className="mt-4 flex flex-col gap-4">
+            <div className="rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-3 py-3">
+              <input
+                value={generatedPassword}
+                readOnly
+                className="w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                placeholder="Génère et copie en 1 clic"
+              />
+              <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
+                  <span>Longueur</span>
+                  <input
+                    type="range"
+                    min={12}
+                    max={48}
+                    value={passwordLength}
+                    onChange={(event) => setPasswordLength(Number(event.target.value))}
+                  />
+                  <span>{passwordLength}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopyGenerated}
+                  className="pill border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                >
+                  Copier
+                </button>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useUpper}
+                  onChange={(event) => setUseUpper(event.target.checked)}
+                />
+                Majuscules
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useLower}
+                  onChange={(event) => setUseLower(event.target.checked)}
+                />
+                Minuscules
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useNumbers}
+                  onChange={(event) => setUseNumbers(event.target.checked)}
+                />
+                Chiffres
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useSymbols}
+                  onChange={(event) => setUseSymbols(event.target.checked)}
+                />
+                Symboles
+              </label>
+            </div>
+          </div>
         </div>
       </section>
+
 
       {toast ? (
         <div className="fixed bottom-6 right-6 z-50">
@@ -1853,4 +1973,5 @@ function App() {
 }
 
 export default App
+
 
