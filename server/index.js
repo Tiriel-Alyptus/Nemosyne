@@ -11,6 +11,7 @@ import nodemailer from 'nodemailer'
 import speakeasy from 'speakeasy'
 import qrcode from 'qrcode'
 import Stripe from 'stripe'
+import { createClient } from '@supabase/supabase-js'
 import { Pool } from 'pg'
 
 // Load env vars from .env, then let .env.local override if present (mirrors CRA-style behavior).
@@ -28,6 +29,18 @@ const cookieSecure = process.env.COOKIE_SECURE === 'true' || isProd
 const sessionSecret =
   process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex')
 const appUrl = process.env.APP_URL || `http://localhost:${port}`
+
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
+const supabaseServiceKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_PUBLISHABLE_DEFAULT_KEY
+const supabaseAdmin =
+  supabaseUrl && supabaseServiceKey
+    ? createClient(supabaseUrl, supabaseServiceKey, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      })
+    : null
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) {
@@ -226,11 +239,15 @@ app.post(
 
 app.use(express.json({ limit: '25mb' }))
 
+const isProdEnv = process.env.NODE_ENV === 'production'
+
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 120,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  // En dev, on désactive; en prod, on passe les checks de session hors quota
+  skip: (req) => !isProdEnv || req.path === '/session',
 })
 
 const createLimiter = rateLimit({
@@ -238,6 +255,7 @@ const createLimiter = rateLimit({
   limit: 30,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: () => !isProdEnv,
 })
 
 const authLimiter = rateLimit({
@@ -245,6 +263,7 @@ const authLimiter = rateLimit({
   limit: 10,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: () => !isProdEnv,
 })
 
 const verifyLimiter = rateLimit({
@@ -252,6 +271,7 @@ const verifyLimiter = rateLimit({
   limit: 5,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: () => !isProdEnv,
 })
 
 const revealLimiterByIp = rateLimit({
@@ -259,6 +279,7 @@ const revealLimiterByIp = rateLimit({
   limit: 30,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: () => !isProdEnv,
 })
 
 const revealLimiterById = rateLimit({
@@ -498,6 +519,77 @@ async function verifyPassword(hash, password) {
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex')
+}
+
+async function getSupabaseUserFromToken(accessToken) {
+  if (!supabaseAdmin || typeof accessToken !== 'string' || accessToken.length < 16) {
+    return null
+  }
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(accessToken)
+    if (error || !data?.user) {
+      return null
+    }
+    return data.user
+  } catch (error) {
+    console.warn('Supabase getUser failed', error?.message || error)
+    return null
+  }
+}
+
+async function ensureUserFromSupabase(sbUser) {
+  if (!sbUser?.id) return null
+  const normalizedEmail =
+    typeof sbUser.email === 'string' ? sbUser.email.toLowerCase().trim() : ''
+  const verifiedFromSupabase = Boolean(sbUser.email_confirmed_at || sbUser.confirmed_at)
+  let user = await getUserById(sbUser.id)
+  const now = Date.now()
+  if (!user) {
+    const passwordHash = await hashPassword(crypto.randomBytes(24).toString('hex'))
+    const columns = [
+      'id',
+      'email',
+      'password_hash',
+      'created_at_ts',
+      'verified',
+      'verify_token_hash',
+      'verify_token_expires_at',
+      'mfa_enabled',
+      'mfa_secret',
+      'mfa_temp_secret',
+    ]
+    const values = [
+      sbUser.id,
+      normalizedEmail || sbUser.id,
+      passwordHash,
+      now,
+      verifiedFromSupabase,
+      null,
+      null,
+      false,
+      null,
+      null,
+    ]
+    if (planEnabled) {
+      columns.push('plan', 'plan_changed_at_ts')
+      values.push('free', now)
+    }
+    const placeholders = columns.map((_, index) => `$${index + 1}`)
+    await pool.query(
+      `INSERT INTO users (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`,
+      values,
+    )
+    user = await getUserById(sbUser.id)
+  } else {
+    const verifiedValue = verifiedFromSupabase || user.verified
+    await pool.query('UPDATE users SET email = $1, verified = $2 WHERE id = $3', [
+      normalizedEmail || user.email,
+      verifiedValue,
+      sbUser.id,
+    ])
+    user = await getUserById(sbUser.id)
+  }
+  return user
 }
 
 function getRequestBase(req) {
@@ -799,6 +891,54 @@ app.post('/api/billing/checkout', authLimiter, async (req, res, next) => {
   } catch (error) {
     next(error)
   }
+})
+
+app.post('/api/auth/supabase-sync', authLimiter, async (req, res) => {
+  await dbReady
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: 'supabase-unavailable' })
+  }
+  const { accessToken } = req.body || {}
+  if (typeof accessToken !== 'string' || accessToken.length < 16) {
+    return res.status(400).json({ error: 'missing-token' })
+  }
+  const sbUser = await getSupabaseUserFromToken(accessToken)
+  if (!sbUser) {
+    return res.status(401).json({ error: 'invalid-token' })
+  }
+  const user = await ensureUserFromSupabase(sbUser)
+  if (!user) {
+    return res.status(500).json({ error: 'user-sync-failed' })
+  }
+  const now = Date.now()
+  let sessionId = req.session?.id
+  if (sessionId && req.session.ownerType === 'anon') {
+    await pool.query(
+      'UPDATE sessions SET owner_type = $1, owner_id = $2, last_seen_ts = $3 WHERE id = $4',
+      ['user', user.id, now, sessionId],
+    )
+  } else {
+    sessionId = crypto.randomUUID()
+    await pool.query(
+      'INSERT INTO sessions (id, owner_type, owner_id, created_at_ts, last_seen_ts) VALUES ($1, $2, $3, $4, $5)',
+      [sessionId, 'user', user.id, now, now],
+    )
+  }
+  req.session = {
+    id: sessionId,
+    ownerType: 'user',
+    ownerId: user.id,
+    createdAtTs: now,
+    lastSeenTs: now,
+  }
+  setSessionCookie(res, sessionId)
+  const plan = await buildPlanResponse(user)
+  return res.json({
+    ok: true,
+    email: user.email,
+    verified: user.verified,
+    plan,
+  })
 })
 
 app.post('/api/auth/register', authLimiter, async (req, res) => {
@@ -1199,34 +1339,30 @@ app.post(
       return res.status(400).json({ error: 'invalid-id' })
     }
     const client = await pool.connect()
+    const now = Date.now()
     try {
       await client.query('BEGIN')
-      const now = Date.now()
-      const selectResult = await client.query(
-        'SELECT * FROM pushes WHERE id = $1 FOR UPDATE',
-        [req.params.id],
+      const updateResult = await client.query(
+        `UPDATE pushes
+         SET views_left = views_left - 1
+         WHERE id = $1 AND expires_at_ts > $2 AND views_left > 0
+         RETURNING *`,
+        [req.params.id, now],
       )
-      const row = selectResult.rows[0]
-      const item = mapPush(row)
-      if (
-        !item ||
-        item.expiresAtTs <= now ||
-        item.viewsLeft <= 0
-      ) {
+      const row = updateResult.rows[0]
+      if (!row) {
         await client.query('ROLLBACK')
         return res.status(404).json({ error: 'not-found' })
       }
-      const nextViews = item.viewsLeft - 1
-      if (nextViews <= 0) {
-        await client.query('DELETE FROM pushes WHERE id = $1', [item.id])
-      } else {
-        await client.query('UPDATE pushes SET views_left = $1 WHERE id = $2', [
-          nextViews,
-          item.id,
-        ])
+
+      // When the last view is consumed, delete the row so the link disappears immediately.
+      if (row.views_left <= 0) {
+        await client.query('DELETE FROM pushes WHERE id = $1', [row.id])
       }
+
       await client.query('COMMIT')
-      return res.json({ ...item, viewsLeft: Math.max(0, nextViews) })
+      const item = mapPush(row)
+      return res.json({ ...item, viewsLeft: Math.max(0, item.viewsLeft) })
     } catch (error) {
       await client.query('ROLLBACK')
       console.error('Failed to reveal push', error)

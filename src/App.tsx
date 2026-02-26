@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import type { AuthChangeEvent, Session, User } from '@supabase/supabase-js'
 import logo from './assets/logo.svg'
 import VaultPage from './vault/VaultPage'
+import { supabase } from './lib/supabaseClient'
 
 type PushMeta = {
   id: string
@@ -356,18 +358,28 @@ function Home() {
     plan?: PlanId
   }>({ authenticated: false, email: null, ownerType: 'anon', plan: 'free' })
   const [plan, setPlan] = useState<PlanInfo>(defaultPlan)
+  const [supabaseUser, setSupabaseUser] = useState<User | null>(null)
+  const [mfaFactors, setMfaFactors] = useState<any[]>([])
+  const [mfaEnroll, setMfaEnroll] = useState<{ factorId: string; qr: string; uri?: string } | null>(
+    null,
+  )
+  const [mfaChallenge, setMfaChallenge] = useState<{
+    factorId: string
+    challengeId: string
+  } | null>(null)
+  const [authTab, setAuthTab] = useState<'login' | 'signup' | 'reset' | 'mfa'>('login')
+  const [authBanner, setAuthBanner] = useState<{
+    tone: 'success' | 'error' | 'info'
+    text: string
+  } | null>(null)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [otp, setOtp] = useState('')
-  const [authError, setAuthError] = useState('')
   const [authLoading, setAuthLoading] = useState(false)
   const [showAuth, setShowAuth] = useState(false)
   const [showUpgrade, setShowUpgrade] = useState(false)
   const [paywallReason, setPaywallReason] = useState<string | null>(null)
   const [planLoading, setPlanLoading] = useState(false)
-  const [mfaRequired, setMfaRequired] = useState(false)
-  const [mfaSetup, setMfaSetup] = useState(false)
-  const [mfaQr, setMfaQr] = useState<string | null>(null)
   const [secret, setSecret] = useState('')
   const [mode, setMode] = useState<'text' | 'file'>('text')
   const [file, setFile] = useState<File | null>(null)
@@ -399,10 +411,6 @@ function Home() {
     }, 2200)
   }
 
-  const remainingPushes = useMemo(() => {
-    if (plan.monthlyPushLimit === null) return null
-    return Math.max(0, plan.monthlyPushLimit - plan.monthlyUsed)
-  }, [plan])
   const expiryLimitMinutes = useMemo(
     () => Math.floor(plan.maxTtlMs / (60 * 1000)),
     [plan.maxTtlMs],
@@ -422,37 +430,93 @@ function Home() {
     return date.getTime()
   }, [expiry])
   const expiresAtLabel = useMemo(() => formatTime(expiresAt), [expiresAt])
-  const pushProgress = useMemo(() => {
-    if (plan.monthlyPushLimit === null) return 100
-    if (plan.monthlyPushLimit === 0) return 0
-    return Math.min(100, (plan.monthlyUsed / plan.monthlyPushLimit) * 100)
-  }, [plan.monthlyPushLimit, plan.monthlyUsed])
-
-  const focusComposer = () => {
-    const editor = document.getElementById('memo-area') as HTMLTextAreaElement | null
-    if (editor) editor.focus()
-  }
 
   const triggerUpgrade = (reason: string) => {
     setPaywallReason(reason)
     setShowUpgrade(true)
   }
 
-  const fetchPlanInfo = async (sessionOverride?: {
-    authenticated: boolean
-    plan?: PlanId
-  }) => {
-    const targetSession = sessionOverride ?? auth
-    if (!targetSession.authenticated) {
-      setPlan(defaultPlan)
-      return
-    }
+  const fetchPlanInfo = useCallback(
+    async (sessionOverride?: {
+      authenticated: boolean
+      plan?: PlanId
+    }) => {
+      const targetSession = sessionOverride
+      if (!targetSession || !targetSession.authenticated) {
+        setPlan(defaultPlan)
+        return
+      }
+      try {
+        const planData = await apiRequest<PlanInfo>('/api/plan')
+        setPlan(planData)
+      } catch {
+        setPlan(defaultPlan)
+      }
+    },
+    [],
+  )
+
+  const syncSupabaseSession = useCallback(
+    async (session?: Session | null) => {
+      const token =
+        session?.access_token ??
+        (await supabase.auth.getSession()).data.session?.access_token
+      if (!token) return
+      try {
+        const result = await apiRequest<{
+          ok: boolean
+          email: string
+          verified: boolean
+          plan?: PlanInfo
+        }>('/api/auth/supabase-sync', {
+          method: 'POST',
+          body: JSON.stringify({ accessToken: token }),
+        })
+        setAuth((current) => ({
+          authenticated: true,
+          email: result.email,
+          ownerType: 'user',
+          verified: result.verified,
+          mfaEnabled: current.mfaEnabled,
+          plan: result.plan?.plan ?? current.plan ?? 'free',
+        }))
+        if (result.plan) {
+          setPlan(result.plan)
+        }
+      } catch (error) {
+        console.warn('Impossible de synchroniser la session Supabase', error)
+      }
+    },
+    [],
+  )
+
+  const refreshMfaFactors = useCallback(async () => {
     try {
-      const planData = await apiRequest<PlanInfo>('/api/plan')
-      setPlan(planData)
-    } catch {
-      setPlan(defaultPlan)
+      const session = await supabase.auth.getSession()
+      if (!session.data.session) {
+        return false
+      }
+      const { data, error } = await supabase.auth.mfa.listFactors()
+      if (error || !data) return false
+      const factors = data.all ?? []
+      setMfaFactors(factors)
+      const hasVerifiedTotp = factors.some(
+        (factor) => factor.factor_type === 'totp' && factor.status === 'verified',
+      )
+      setAuth((current) => ({ ...current, mfaEnabled: hasVerifiedTotp }))
+      return hasVerifiedTotp
+    } catch (error) {
+      console.warn('Liste MFA Supabase impossible', error)
+      return false
     }
+  }, [])
+
+  const friendlyAuthError = (message?: string) => {
+    if (!message) return 'Action impossible.'
+    if (message.includes('Invalid login credentials')) return 'Identifiants invalides.'
+    if (message.includes('Email rate limit exceeded')) return 'Trop de tentatives, patiente 30s.'
+    if (message.includes('Email not confirmed')) return 'VÃ©rifie ton email avant de te connecter.'
+    return message
   }
 
   const handleSelectPlan = async (nextPlan: PlanId) => {
@@ -528,7 +592,7 @@ function Home() {
       }
     }
     hydrate()
-  }, [])
+  }, [fetchPlanInfo])
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -548,9 +612,9 @@ function Home() {
     if (checkout) {
       window.history.replaceState({}, '', location.pathname)
     }
-  }, [location.search])
+  }, [location.search, fetchPlanInfo])
 
-  const refreshHistory = async () => {
+  const refreshHistory = useCallback(async () => {
     try {
       const session = await apiRequest<{
         authenticated: boolean
@@ -568,51 +632,104 @@ function Home() {
       setPlan(defaultPlan)
       setHistory([])
     }
-  }
+  }, [fetchPlanInfo])
+
+  useEffect(() => {
+    const bootstrapSupabase = async () => {
+      const { data } = await supabase.auth.getSession()
+      setSupabaseUser(data.session?.user ?? null)
+      if (data.session?.access_token) {
+        await syncSupabaseSession(data.session)
+        await refreshMfaFactors()
+        await refreshHistory()
+      }
+    }
+    bootstrapSupabase()
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      async (_event: AuthChangeEvent, session) => {
+        setSupabaseUser(session?.user ?? null)
+        if (session?.access_token) {
+          await syncSupabaseSession(session)
+          await refreshMfaFactors()
+          await refreshHistory()
+          setShowAuth(false)
+        } else {
+          setAuth({ authenticated: false, email: null, ownerType: 'anon', plan: 'free' })
+          setPlan(defaultPlan)
+          setSupabaseUser(null)
+        }
+      },
+    )
+    return () => {
+      listener.subscription.unsubscribe()
+    }
+  }, [refreshHistory, refreshMfaFactors, syncSupabaseSession])
+
+  useEffect(() => {
+    if (supabaseUser) {
+      const verifiedFromSupabase = Boolean(
+        (supabaseUser as any)?.email_confirmed_at || (supabaseUser as any)?.confirmed_at,
+      )
+      setAuth((current) => ({
+        authenticated: true,
+        email: supabaseUser.email ?? current.email ?? null,
+        ownerType: 'user',
+        verified: verifiedFromSupabase || current.verified,
+        mfaEnabled: current.mfaEnabled,
+        plan: current.plan ?? 'free',
+      }))
+    }
+  }, [supabaseUser])
 
   const handleLogin = async () => {
     setAuthLoading(true)
-    setAuthError('')
-    setMfaRequired(false)
-    if (!email.trim() || !email.includes('@')) {
-      setAuthError('Email invalide.')
+    setAuthBanner(null)
+    setMfaChallenge(null)
+    const normalizedEmail = email.trim().toLowerCase()
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      setAuthBanner({ tone: 'error', text: 'Email invalide.' })
       setAuthLoading(false)
       return
     }
     if (password.length < 12) {
-      setAuthError('Mot de passe trop court (12 caractères minimum).')
+      setAuthBanner({ tone: 'error', text: 'Mot de passe trop court (12 caractères mini).' })
       setAuthLoading(false)
       return
     }
     try {
-      const result = await apiRequest<{ ok: boolean; email: string }>(
-        '/api/auth/login',
-        {
-          method: 'POST',
-          body: JSON.stringify({ email, password, otp: otp || undefined }),
-        },
-      )
-      setAuth({
-        authenticated: true,
-        email: result.email,
-        ownerType: 'user',
-        plan: plan.plan ?? 'free',
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: normalizedEmail,
+        password,
       })
-      setPassword('')
-      setOtp('')
-      await refreshHistory()
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('mfa-required')) {
-        setMfaRequired(true)
-        setAuthError('Code MFA requis.')
-      } else if (error instanceof Error && error.message.includes('invalid-otp')) {
-        setMfaRequired(true)
-        setAuthError('Code MFA invalide.')
-      } else if (error instanceof Error && error.message.includes('email-not-verified')) {
-        setAuthError('Email non vérifié.')
-      } else {
-        setAuthError('Identifiants invalides.')
+      if (error) {
+        setAuthBanner({ tone: 'error', text: friendlyAuthError(error.message) })
+        return
       }
+      const { data: aalData } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+      if (aalData?.nextLevel === 'aal2') {
+        const factors = await supabase.auth.mfa.listFactors()
+        const totpFactor = factors.data?.all?.find(
+          (factor) => factor.factor_type === 'totp' && factor.status === 'verified',
+        )
+        if (totpFactor) {
+          const challenge = await supabase.auth.mfa.challenge({ factorId: totpFactor.id })
+          if (challenge.error || !challenge.data?.id) {
+            setAuthBanner({ tone: 'error', text: 'Impossible de créer le challenge MFA.' })
+          } else {
+            setMfaChallenge({ factorId: totpFactor.id, challengeId: challenge.data.id })
+            setAuthTab('mfa')
+            setAuthBanner({ tone: 'info', text: 'Entre ton code MFA pour terminer.' })
+            return
+          }
+        }
+      }
+      setAuthBanner({ tone: 'success', text: 'Connexion OK, synchronisation en cours…' })
+      await syncSupabaseSession(data.session)
+      await refreshMfaFactors()
+      await refreshHistory()
+      setShowAuth(false)
+    } catch (error) {
+      setAuthBanner({ tone: 'error', text: friendlyAuthError((error as Error)?.message) })
     } finally {
       setAuthLoading(false)
     }
@@ -620,53 +737,70 @@ function Home() {
 
   const handleRegister = async () => {
     setAuthLoading(true)
-    setAuthError('')
-    setMfaRequired(false)
-    if (!email.trim() || !email.includes('@')) {
-      setAuthError('Email invalide.')
+    setAuthBanner(null)
+    const normalizedEmail = email.trim().toLowerCase()
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      setAuthBanner({ tone: 'error', text: 'Email invalide.' })
       setAuthLoading(false)
       return
     }
     if (password.length < 12) {
-      setAuthError('Mot de passe trop court (12 caractères minimum).')
+      setAuthBanner({ tone: 'error', text: 'Mot de passe trop court (12 caractères mini).' })
       setAuthLoading(false)
       return
     }
     try {
-      const result = await apiRequest<{ ok: boolean; email: string }>(
-        '/api/auth/register',
-        {
-          method: 'POST',
-          body: JSON.stringify({ email, password }),
-        },
-      )
-      setAuth({ authenticated: true, email: result.email, ownerType: 'user', plan: 'free' })
-      setPlan(defaultPlan)
-      setPassword('')
-      await refreshHistory()
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('api-409')) {
-        setAuthError('Email déjà utilisé.')
-      } else if (error instanceof Error && error.message.includes('api-400')) {
-        setAuthError('Email ou mot de passe invalide.')
+      const redirectTo =
+        typeof window !== 'undefined' ? `${window.location.origin}/verify` : undefined
+      const { error } = await supabase.auth.signUp({
+        email: normalizedEmail,
+        password,
+        options: { emailRedirectTo: redirectTo },
+      })
+      if (error) {
+        setAuthBanner({ tone: 'error', text: friendlyAuthError(error.message) })
       } else {
-        setAuthError('Impossible de créer le compte.')
+        setAuthBanner({
+          tone: 'success',
+          text: 'Compte créé. Vérifie ta boîte mail pour activer ton compte.',
+        })
+        setAuthTab('login')
       }
+    } catch (error) {
+      setAuthBanner({ tone: 'error', text: friendlyAuthError((error as Error)?.message) })
     } finally {
       setAuthLoading(false)
     }
   }
 
-  const handleLogout = async () => {
+  const handleResetPassword = async () => {
     setAuthLoading(true)
-    setAuthError('')
+    setAuthBanner(null)
+    const normalizedEmail = email.trim().toLowerCase()
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      setAuthBanner({ tone: 'error', text: 'Email invalide.' })
+      setAuthLoading(false)
+      return
+    }
     try {
-      await apiRequest('/api/auth/logout', { method: 'POST' })
-      setAuth({ authenticated: false, email: null, ownerType: 'anon', plan: 'free' })
-      setPlan(defaultPlan)
-      await refreshHistory()
-    } catch {
-      setAuthError('Déconnexion impossible.')
+      const redirectTo =
+        typeof window !== 'undefined'
+          ? `${window.location.origin}/verify?type=recovery`
+          : undefined
+      const { error } = await supabase.auth.resetPasswordForEmail(normalizedEmail, {
+        redirectTo,
+      })
+      if (error) {
+        setAuthBanner({ tone: 'error', text: friendlyAuthError(error.message) })
+      } else {
+        setAuthBanner({
+          tone: 'success',
+          text: 'Email de réinitialisation envoyé. Vérifie ta boîte.',
+        })
+        setAuthTab('login')
+      }
+    } catch (error) {
+      setAuthBanner({ tone: 'error', text: friendlyAuthError((error as Error)?.message) })
     } finally {
       setAuthLoading(false)
     }
@@ -674,56 +808,149 @@ function Home() {
 
   const handleResendVerification = async () => {
     setAuthLoading(true)
-    setAuthError('')
-    try {
-      await apiRequest('/api/auth/resend-verification', {
-        method: 'POST',
-        body: JSON.stringify({ email }),
-      })
-      setAuthError('Email de vérification envoyé.')
-    } catch {
-      setAuthError('Impossible d’envoyer la vérification.')
-    } finally {
+    setAuthBanner(null)
+    const normalizedEmail = email.trim().toLowerCase()
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      setAuthBanner({ tone: 'error', text: 'Email invalide.' })
       setAuthLoading(false)
+      return
     }
+    const { error } = await supabase.auth.resend({
+      type: 'signup',
+      email: normalizedEmail,
+    })
+    setAuthBanner(
+      error
+        ? { tone: 'error', text: friendlyAuthError(error.message) }
+        : { tone: 'success', text: 'Email de vérification renvoyé.' },
+    )
+    setAuthLoading(false)
   }
 
-  const handleMfaSetup = async () => {
+  const handleVerifyMfaChallenge = async () => {
+    if (!mfaChallenge) return
     setAuthLoading(true)
-    setAuthError('')
-    try {
-      const result = await apiRequest<{ otpauthUrl: string; qr: string }>(
-        '/api/mfa/setup',
-        { method: 'POST' },
-      )
-      setMfaQr(result.qr)
-      setMfaSetup(true)
-    } catch {
-      setAuthError('Impossible de configurer le MFA.')
-    } finally {
+    setAuthBanner(null)
+    const result = await supabase.auth.mfa.verify({
+      factorId: mfaChallenge.factorId,
+      challengeId: mfaChallenge.challengeId,
+      code: otp,
+    })
+    if (result.error) {
+      setAuthBanner({ tone: 'error', text: 'Code MFA invalide.' })
       setAuthLoading(false)
+      return
     }
+    setAuthBanner({ tone: 'success', text: 'MFA validé.' })
+    setOtp('')
+    setMfaChallenge(null)
+    await refreshMfaFactors()
+    const latestSession = (await supabase.auth.getSession()).data.session
+    await syncSupabaseSession(latestSession)
+    await refreshHistory()
+    setShowAuth(false)
+    setAuthTab('login')
+    setAuthLoading(false)
   }
 
-  const handleMfaEnable = async () => {
+  const handleStartMfaEnroll = async () => {
     setAuthLoading(true)
-    setAuthError('')
-    try {
-      await apiRequest('/api/mfa/enable', {
-        method: 'POST',
-        body: JSON.stringify({ otp }),
+    setAuthBanner(null)
+    const { data, error } = await supabase.auth.mfa.enroll({
+      factorType: 'totp',
+      friendlyName: 'Authenticator',
+    })
+    if (error || !data?.id || !data?.totp?.qr_code) {
+      setAuthBanner({ tone: 'error', text: 'Impossible de préparer le MFA.' })
+    } else {
+      setMfaEnroll({ factorId: data.id, qr: data.totp.qr_code, uri: data.totp.uri })
+      setAuthTab('mfa')
+      setAuthBanner({
+        tone: 'info',
+        text: 'Scanne le QR Code puis saisis le code à 6 chiffres.',
       })
+    }
+    setAuthLoading(false)
+  }
+
+  const handleConfirmMfaEnroll = async () => {
+    if (!mfaEnroll) return
+    setAuthLoading(true)
+    setAuthBanner(null)
+    const challenge = await supabase.auth.mfa.challenge({ factorId: mfaEnroll.factorId })
+    if (challenge.error || !challenge.data?.id) {
+      setAuthBanner({ tone: 'error', text: 'Challenge MFA introuvable.' })
+      setAuthLoading(false)
+      return
+    }
+    const verification = await supabase.auth.mfa.verify({
+      factorId: mfaEnroll.factorId,
+      challengeId: challenge.data.id,
+      code: otp,
+    })
+    if (verification.error) {
+      setAuthBanner({ tone: 'error', text: 'Code MFA invalide.' })
+      setAuthLoading(false)
+      return
+    }
+    setAuthBanner({ tone: 'success', text: 'MFA activé sur ton compte.' })
+    setOtp('')
+    setMfaEnroll(null)
+    await refreshMfaFactors()
+    const latestSession = (await supabase.auth.getSession()).data.session
+    await syncSupabaseSession(latestSession)
+    setAuthLoading(false)
+  }
+
+  const handleDisableMfa = async () => {
+    const activeFactor = mfaFactors.find(
+      (factor) => factor.factor_type === 'totp' && factor.status === 'verified',
+    )
+    if (!activeFactor) {
+      setAuthBanner({ tone: 'info', text: 'Aucun MFA actif.' })
+      return
+    }
+    setAuthLoading(true)
+    const { error } = await supabase.auth.mfa.unenroll({ factorId: activeFactor.id })
+    if (error) {
+      setAuthBanner({ tone: 'error', text: 'Impossible de désactiver le MFA.' })
+    } else {
+      setAuthBanner({ tone: 'success', text: 'MFA désactivé.' })
+      await refreshMfaFactors()
+      await syncSupabaseSession()
+    }
+    setAuthLoading(false)
+  }
+
+  const handleLogout = async (fromSupabase = false) => {
+    setAuthLoading(true)
+    setAuthBanner(null)
+    try {
+      if (!fromSupabase) {
+        await supabase.auth.signOut()
+      }
+      await apiRequest('/api/auth/logout', { method: 'POST' })
+    } catch {
+      // ignore
+    } finally {
+      setAuth({
+        authenticated: false,
+        email: null,
+        ownerType: 'anon',
+        plan: 'free',
+        verified: false,
+        mfaEnabled: false,
+      })
+      setPlan(defaultPlan)
+      setSupabaseUser(null)
+      setHistory([])
+      setShowAuth(false)
+      setMfaEnroll(null)
+      setMfaChallenge(null)
       setOtp('')
-      setMfaSetup(false)
-      setMfaQr(null)
-      await refreshHistory()
-    } catch {
-      setAuthError('Code MFA invalide.')
-    } finally {
       setAuthLoading(false)
     }
   }
-
 
   const handleGenerate = async () => {
     if (typeof window !== 'undefined' && (!window.isSecureContext || !crypto?.subtle)) {
@@ -908,138 +1135,197 @@ function Home() {
     generatePassword()
   }, [passwordLength, useUpper, useLower, useNumbers, useSymbols])
 
+  const resetComposer = () => {
+    setSecret('')
+    setFile(null)
+    setFileError('')
+    setPassphrase('')
+    setViews(Math.min(plan.maxViews, 3))
+    setExpiry(Math.min(expiryLimitMinutes, presets[2].minutes))
+    setLink('')
+    setStatus('idle')
+    setMode('text')
+    setLabel(generateLabel())
+  }
+
   return (
-    <div className="mx-auto flex w-full max-w-[1480px] flex-col gap-10 pb-14 px-4 sm:px-6">
-      <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+    <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-8 pb-14 px-4 sm:px-6">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
-          <img src={logo} alt="Nemosyne logo" className="h-10 w-10" />
-          <div className="flex flex-col leading-tight">
-            <span className="text-3xl font-semibold tracking-tight">Nemosyne</span>
-            <span className="text-[11px] uppercase tracking-[0.28em] text-[var(--ink-soft)]">
-              Mémos chiffrés
-            </span>
+          <img src={logo} alt="Nemosyne logo" className="h-9 w-9" />
+          <div className="leading-tight">
+            <p className="text-2xl font-semibold tracking-tight">Nemosyne</p>
+            <p className="text-xs text-[var(--ink-soft)]">Liens sécurisés, auto-destruits.</p>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 lg:gap-4">
-          <div className="flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] p-1">
-            <button
-              type="button"
-              onClick={() => setTheme('dark')}
-              className={`h-6 w-6 rounded-full border ${
-                theme === 'dark'
-                  ?'border-[var(--primary)] bg-[var(--primary)]'
-                  : 'border-[var(--line)] bg-[var(--surface)]'
-              }`}
-              aria-label="Mode sombre"
-            />
-            <button
-              type="button"
-              onClick={() => setTheme('light')}
-              className={`h-6 w-6 rounded-full border ${
-                theme === 'light'
-                  ?'border-[var(--primary)] bg-[var(--primary)]'
-                  : 'border-[var(--line)] bg-[var(--surface)]'
-              }`}
-              aria-label="Mode clair"
-            />
-          </div>
-          <div className="flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
-            <span>FR</span>
-            <span className="h-5 w-px bg-[var(--line)]" />
-            <span>EN</span>
-          </div>
-          <div className="flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
-            <span className="font-semibold text-[var(--ink)]">{plan.label}</span>
-            <span className="h-5 w-px bg-[var(--line)]" />
-            <span>
-              {plan.monthlyPushLimit === null
-                ? 'Illimité'
-                : `${plan.monthlyUsed}/${plan.monthlyPushLimit}`}
-            </span>
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+            className="rounded-full border border-[var(--line)] px-3 py-1 text-xs text-[var(--ink-soft)]"
+            aria-label="Basculer le thème"
+          >
+            {theme === 'light' ? 'Mode sombre' : 'Mode clair'}
+          </button>
+          <span className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
+            Plan {plan.label}{' '}
+            {plan.monthlyPushLimit === null
+              ? '(illimité)'
+              : `${plan.monthlyUsed}/${plan.monthlyPushLimit}`}
+          </span>
           <button
             type="button"
             onClick={() => setShowAuth(true)}
-            className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
+            className="rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:opacity-90"
           >
-            Espace compte
+            Compte / Upgrade
           </button>
         </div>
       </header>
 
 
-      {showAuth ?(
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
-          <div className="card-elev w-full max-w-md rounded-2xl border border-[var(--line)]">
-            <div className="flex items-center justify-between border-b border-[var(--line)] px-5 py-3">
-              <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Accès à la gestion de mot de passe
-              </p>
-              <button
-                type="button"
-                onClick={() => setShowAuth(false)}
-                className="text-sm text-[var(--ink-soft)]"
-                aria-label="Fermer"
-              >
-                ✕
-              </button>
-            </div>
-            <div className="flex flex-col gap-3 px-5 py-4">
-              {auth.authenticated ?(
-                <div className="flex flex-col gap-2">
-                  <p className="text-sm text-[var(--ink)]">
-                    Connecté: <span className="font-semibold">{auth.email}</span>
+
+      {showAuth ? (
+        <div className="fixed inset-0 z-50 bg-black/55 px-3 py-6 sm:px-6 sm:py-10">
+          <div className="mx-auto grid w-full max-w-5xl gap-0 rounded-3xl border border-[var(--line)] bg-[var(--surface)] shadow-2xl md:grid-cols-[1.05fr,1fr]">
+            <div className="flex flex-col gap-4 border-b border-[var(--line)] px-6 py-5 md:border-b-0 md:border-r">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--ink-soft)]">
+                    Espace compte
                   </p>
-                  {!auth.verified ?(
-                    <div className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-2 text-xs text-[var(--ink-soft)]">
-                      Email non vérifié. Vérifiez votre boîte mail.
-                    </div>
-                  ) : null}
-                  {auth.verified && !auth.mfaEnabled ?(
-                    <button
-                      type="button"
-                      onClick={handleMfaSetup}
-                      disabled={authLoading}
-                      className="w-fit rounded-md border border-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
-                    >
-                      Activer le MFA
-                    </button>
-                  ) : null}
-                  {mfaSetup && mfaQr ?(
-                    <div className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-3 text-xs text-[var(--ink-soft)]">
-                      <p className="mb-2">Scannez le QR code avec Google Authenticator.</p>
-                      <img src={mfaQr} alt="QR MFA" className="h-40 w-40" />
-                      <input
-                        value={otp}
-                        onChange={(event) => setOtp(event.target.value)}
-                        placeholder="Code MFA"
-                        className="mt-3 w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                      />
-                      <button
-                        type="button"
-                        onClick={handleMfaEnable}
-                        disabled={authLoading}
-                        className="mt-2 w-fit rounded-md border border-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
-                      >
-                        Confirmer le MFA
-                      </button>
-                    </div>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={handleLogout}
-                    disabled={authLoading}
-                    className="w-fit rounded-md border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                  >
-                    Se déconnecter
-                  </button>
+                  <p className="text-xl font-semibold text-[var(--ink)]">
+                    {auth.authenticated ? auth.email : 'Créer ou rejoindre'}
+                  </p>
                 </div>
-              ) : (
-                <>
-                  <p className="text-[11px] text-[var(--ink-soft)]">
-                    Compte requis pour envoyer un push, même gratuit (historique local en invité).
-                  </p>
+                <button
+                  type="button"
+                  onClick={() => setShowAuth(false)}
+                  className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-sm text-[var(--ink-soft)] hover:text-[var(--ink)]"
+                  aria-label="Fermer"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-2 text-[11px]">
+                <span className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  Plan {plan.label}
+                </span>
+                <span
+                  className={`rounded-full border px-3 py-1 uppercase tracking-[0.2em] ${
+                    auth.verified
+                      ? 'border-emerald-500/60 bg-emerald-500/10 text-emerald-200'
+                      : 'border-amber-500/60 bg-amber-500/10 text-amber-100'
+                  }`}
+                >
+                  {auth.verified ? 'Email vérifié' : 'Email à vérifier'}
+                </span>
+                <span
+                  className={`rounded-full border px-3 py-1 uppercase tracking-[0.2em] ${
+                    auth.mfaEnabled
+                      ? 'border-emerald-500/60 bg-emerald-500/10 text-emerald-200'
+                      : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)]'
+                  }`}
+                >
+                  {auth.mfaEnabled ? 'MFA TOTP actif' : 'MFA non configuré'}
+                </span>
+              </div>
+              <div className="rounded-2xl bg-[var(--surface-muted)] px-4 py-3 text-sm text-[var(--ink-soft)]">
+                <p className="font-semibold text-[var(--ink)]">Flux Supabase Auth</p>
+                <ul className="mt-2 flex flex-col gap-2 text-[13px]">
+                  <li>• Emails de vérification et magic links gérés par Supabase.</li>
+                  <li>• Reset mot de passe avec redirection locale (/verify).</li>
+                  <li>• MFA TOTP compatible Authenticator / 1Password.</li>
+                  <li>• Session backend synchronisée pour quotas et historique.</li>
+                </ul>
+              </div>
+              <div className="rounded-2xl border border-[var(--line)] px-4 py-3 text-sm text-[var(--ink-soft)]">
+                <p className="font-semibold text-[var(--ink)]">État</p>
+                <p className="mt-2">
+                  Connexion : {auth.authenticated ? 'connecté' : 'invité'} · Plan {plan.label}.
+                </p>
+                <p className="mt-1">
+                  Quota : {plan.monthlyPushLimit === null ? 'illimité' : `${plan.monthlyUsed}/${plan.monthlyPushLimit} pushes / mois`}.
+                </p>
+                <p className="mt-1">
+                  Sécurité : {auth.verified ? 'email validé' : 'email à confirmer'} · {auth.mfaEnabled ? 'MFA actif' : 'MFA désactivé'}.
+                </p>
+              </div>
+              {auth.authenticated ? (
+                <button
+                  type="button"
+                  onClick={() => handleLogout()}
+                  className="w-fit rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                >
+                  Se déconnecter
+                </button>
+              ) : null}
+            </div>
+            <div className="flex flex-col gap-4 px-6 py-5">
+              <div className="flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.2em]">
+                <button
+                  type="button"
+                  onClick={() => setAuthTab('login')}
+                  className={`rounded-full px-3 py-1 ${
+                    authTab === 'login'
+                      ? 'bg-[var(--primary)] text-white'
+                      : 'border border-[var(--line)] text-[var(--ink-soft)]'
+                  }`}
+                >
+                  Connexion
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthTab('signup')}
+                  className={`rounded-full px-3 py-1 ${
+                    authTab === 'signup'
+                      ? 'bg-[var(--primary)] text-white'
+                      : 'border border-[var(--line)] text-[var(--ink-soft)]'
+                  }`}
+                >
+                  Créer un compte
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthTab('reset')}
+                  className={`rounded-full px-3 py-1 ${
+                    authTab === 'reset'
+                      ? 'bg-[var(--primary)] text-white'
+                      : 'border border-[var(--line)] text-[var(--ink-soft)]'
+                  }`}
+                >
+                  Réinitialiser
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthTab('mfa')}
+                  className={`rounded-full px-3 py-1 ${
+                    authTab === 'mfa'
+                      ? 'bg-[var(--primary)] text-white'
+                      : 'border border-[var(--line)] text-[var(--ink-soft)]'
+                  }`}
+                >
+                  MFA
+                </button>
+              </div>
+
+              {authBanner ? (
+                <div
+                  className={`rounded-xl border px-4 py-3 text-sm ${
+                    authBanner.tone === 'success'
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100'
+                      : authBanner.tone === 'error'
+                        ? 'border-red-500/40 bg-red-500/10 text-red-100'
+                        : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)]'
+                  }`}
+                >
+                  {authBanner.text}
+                </div>
+              ) : null}
+
+              {authTab === 'login' ? (
+                <div className="flex flex-col gap-3">
                   <input
                     value={email}
                     onChange={(event) => setEmail(event.target.value)}
@@ -1050,48 +1336,170 @@ function Home() {
                     type="password"
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
-                    placeholder="Mot de passe"
+                    placeholder="Mot de passe (>=12 caractères)"
                     className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
                   />
-                  {mfaRequired ?(
-                    <input
-                      value={otp}
-                      onChange={(event) => setOtp(event.target.value)}
-                      placeholder="Code MFA (6 chiffres)"
-                      className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                    />
+                  {mfaChallenge ? (
+                    <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-3">
+                      <p className="text-xs text-[var(--ink-soft)]">MFA requis pour finaliser la connexion.</p>
+                      <input
+                        value={otp}
+                        onChange={(event) => setOtp(event.target.value)}
+                        placeholder="Code MFA (6 chiffres)"
+                        className="mt-2 rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleVerifyMfaChallenge}
+                        disabled={authLoading}
+                        className="mt-2 rounded-md border border-[var(--primary)] bg-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-white"
+                      >
+                        Valider le MFA
+                      </button>
+                    </div>
                   ) : null}
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={handleLogin}
                       disabled={authLoading}
-                      className="rounded-md border border-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
+                      className="rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
                     >
                       Se connecter
                     </button>
                     <button
                       type="button"
-                      onClick={handleRegister}
-                      disabled={authLoading}
-                      className="rounded-md border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                      onClick={() => setAuthTab('reset')}
+                      className="rounded-md border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                    >
+                      Mot de passe oublié
+                    </button>
+                  </div>
+                  <p className="text-[12px] text-[var(--ink-soft)]">
+                    Pas encore de compte ?{' '}
+                    <button
+                      type="button"
+                      className="text-[var(--primary)] underline"
+                      onClick={() => setAuthTab('signup')}
                     >
                       Créer un compte
                     </button>
-                  </div>
-                  {authError ?(
-                    <p className="text-xs text-[var(--primary)]">{authError}</p>
-                  ) : null}
+                  </p>
+                </div>
+              ) : null}
+
+              {authTab === 'signup' ? (
+                <div className="flex flex-col gap-3">
+                  <input
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="Email professionnel"
+                    className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                  />
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="Mot de passe (>=12 caractères)"
+                    className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleRegister}
+                    disabled={authLoading}
+                    className="rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+                  >
+                    Créer mon compte
+                  </button>
                   <button
                     type="button"
                     onClick={handleResendVerification}
                     disabled={authLoading}
-                    className="w-fit text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                    className="w-fit text-[12px] uppercase tracking-[0.18em] text-[var(--ink-soft)]"
                   >
-                    Renvoyer l’email de vérification
+                    Renvoyer l'email de vérification
                   </button>
-                </>
-              )}
+                </div>
+              ) : null}
+
+              {authTab === 'reset' ? (
+                <div className="flex flex-col gap-3">
+                  <input
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="Email"
+                    className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleResetPassword}
+                    disabled={authLoading}
+                    className="rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+                  >
+                    Envoyer le lien de réinitialisation
+                  </button>
+                  <p className="text-[12px] text-[var(--ink-soft)]">
+                    Le lien Supabase redirige vers /verify pour saisir un nouveau mot de passe.
+                  </p>
+                </div>
+              ) : null}
+
+              {authTab === 'mfa' ? (
+                <div className="flex flex-col gap-3">
+                  {!auth.authenticated ? (
+                    <p className="text-sm text-[var(--ink-soft)]">
+                      Connecte-toi d'abord pour configurer le MFA.
+                    </p>
+                  ) : mfaEnroll ? (
+                    <div className="flex flex-col gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
+                      <p className="text-sm text-[var(--ink-soft)]">Scanne puis saisis le code TOTP.</p>
+                      <img src={mfaEnroll.qr} alt="QR MFA" className="h-40 w-40 rounded-lg bg-white p-2" />
+                      <input
+                        value={otp}
+                        onChange={(event) => setOtp(event.target.value)}
+                        placeholder="Code TOTP"
+                        className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleConfirmMfaEnroll}
+                        disabled={authLoading}
+                        className="w-fit rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+                      >
+                        Valider le MFA
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-sm text-[var(--ink-soft)]">
+                        {auth.mfaEnabled
+                          ? 'MFA actif. Tu peux le désactiver ou ré-initialiser.'
+                          : 'Renforce l’authentification avec un code TOTP.'}
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={handleStartMfaEnroll}
+                          disabled={authLoading}
+                          className="rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+                        >
+                          Activer MFA TOTP
+                        </button>
+                        {auth.mfaEnabled ? (
+                          <button
+                            type="button"
+                            onClick={handleDisableMfa}
+                            disabled={authLoading}
+                            className="rounded-md border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                          >
+                            Désactiver le MFA
+                          </button>
+                        ) : null}
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
@@ -1102,11 +1510,9 @@ function Home() {
           <div className="card-elev w-full max-w-4xl rounded-2xl border border-[var(--line)]">
             <div className="flex items-center justify-between border-b border-[var(--line)] px-5 py-3">
               <div>
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Paywall doux
-                </p>
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Upgrade</p>
                 <p className="text-sm text-[var(--ink)]">
-                  {paywallReason ?? 'Accès complet aux quotas, audit et gestionnaire de mots de passe.'}
+                  {paywallReason ?? 'Plus de temps, plus de vues, fichiers plus lourds.'}
                 </p>
               </div>
               <button
@@ -1170,370 +1576,158 @@ function Home() {
 
       
 
-      <section className="rounded-3xl border border-[var(--line)] bg-[var(--surface-muted)]/80 px-4 py-3 shadow-[var(--shadow)]">
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink)]">
-            Plan {plan.label}
-          </span>
-          <span className="text-[10px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-            {planPricing[plan.plan].subtitle}
-          </span>
-          <div className="flex items-center gap-2">
-            <div className="h-2 w-32 overflow-hidden rounded-full bg-[var(--surface)]">
-              <div
-                className="h-full rounded-full bg-[var(--primary)] transition-all"
-                style={{ width: `${pushProgress}%` }}
-              />
-            </div>
-            <span className="text-[11px] font-semibold text-[var(--ink)]">
-              {plan.monthlyPushLimit === null ? 'Push illimités' : `${plan.monthlyUsed}/${plan.monthlyPushLimit}`}
-            </span>
-            <span className="text-[10px] text-[var(--ink-soft)]">Reset {formatResetDate(plan.nextResetTs)}</span>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {plan.plan !== 'pro' ? (
-              <button
-                type="button"
-                onClick={() => handleSelectPlan('pro')}
-                disabled={planLoading}
-                className="pill border border-[var(--primary)] bg-transparent px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--primary)] transition hover:bg-[var(--primary-weak)]"
-              >
-                Pro 29 €
-              </button>
-            ) : (
-              <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-                Pro actif
-              </span>
-            )}
-            {plan.plan === 'free' ? (
+      
+      <section className="flex flex-wrap items-center gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)]/70 px-4 py-3 text-sm text-[var(--ink-soft)]">
+        <span className="rounded-full border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink)]">
+          Plan {plan.label}
+        </span>
+        <span>Chiffré dans votre navigateur. Lien supprimé après expiration ou vues.</span>
+        <span className="text-[11px] text-[var(--ink-soft)]">Reset {formatResetDate(plan.nextResetTs)}</span>
+      </section>
+
+      <section
+        id="composer"
+        className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow-strong)] backdrop-blur"
+      >
+        {paywallQuotaReached ? (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-[var(--surface)]/92 backdrop-blur">
+            <p className="text-sm font-semibold text-[var(--ink)]">Quota atteint sur ce plan.</p>
+            <p className="text-xs text-[var(--ink-soft)]">Passe en Premium/Pro pour continuer.</p>
+            <div className="flex gap-2">
               <button
                 type="button"
                 onClick={() => handleSelectPlan('premium')}
-                disabled={planLoading}
-                className="pill border border-[var(--line)] bg-transparent px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--ink)] transition hover:border-[var(--primary)]"
+                className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
               >
-                Premium 19 €
-              </button>
-            ) : null}
-            {!auth.authenticated ? (
-              <button
-                type="button"
-                onClick={() => setShowAuth(true)}
-                className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink)] transition hover:border-[var(--primary)]"
-              >
-                Créer un compte
-              </button>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="mt-2 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-[0.14em] text-[var(--ink-soft)]">
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
-            Expiration max {expiryLimitMinutes >= 1440
-              ? `${Math.round(expiryLimitMinutes / 1440)} j`
-              : `${expiryLimitMinutes} min`}
-          </span>
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
-            Vues max {plan.maxViews}
-          </span>
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
-            Fichier {formatBytes(plan.maxFileBytes)}
-          </span>
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
-            Historique {plan.historyLimit} items
-          </span>
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
-            Push gratuits (compte requis)
-          </span>
-          <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1">
-            {plan.monthlyPushLimit === null
-              ? 'Illimité'
-              : `${remainingPushes ?? plan.monthlyPushLimit} restant(s)`}
-          </span>
-        </div>
-      </section>
-
-
-      <section className="grid gap-6 xl:grid-cols-[1.05fr_1fr]">
-        <div className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface-elev)]/94 p-8 shadow-[var(--shadow-strong)] backdrop-blur">
-          <div className="absolute inset-0 bg-gradient-to-br from-[var(--primary-weak)] via-[var(--surface-muted)] to-transparent" />
-          <div className="absolute -left-28 -top-24 h-64 w-64 rounded-full bg-[var(--primary-weak)] blur-3xl opacity-70" />
-          <div className="absolute inset-x-8 top-10 h-px bg-gradient-to-r from-transparent via-[var(--primary-weak)]/30 to-transparent" />
-          <div className="relative z-10 flex flex-col gap-7">
-            <div className="flex flex-wrap gap-2 text-[10px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-              {['Chiffrement local', 'Zero knowledge', 'Auto-destruction'].map((tag) => (
-                <span
-                  key={tag}
-                  className="pill border border-[var(--line)] bg-transparent px-3 py-1"
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
-
-            <div className="flex flex-col gap-4">
-              <h1 className="text-4xl font-semibold leading-[1.08] text-[var(--ink)] md:text-4xl">
-                Envoyez un mot de passe sécurisé en 10 secondes.
-              </h1>
-              <p className="max-w-2xl text-base text-[var(--ink-soft)] leading-relaxed">
-                Plus jamais de mot de passe en clair dans vos emails. Un lien chiffré, prêt à
-                s'autodétruire après lecture, sans compte obligatoire pour le destinataire.
-              </p>
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/90 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]">
-                <p className="text-base font-semibold text-[var(--ink)]">Chiffrement local</p>
-                <p className="text-sm text-[var(--ink-soft)]">Clé gardée dans l'URL, jamais stockée côté serveur.</p>
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/90 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]">
-                <p className="text-base font-semibold text-[var(--ink)]">Partage immédiat</p>
-                <p className="text-sm text-[var(--ink-soft)]">Lien utilisable en 10 secondes, lecture unique optionnelle.</p>
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/90 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]">
-                <p className="text-base font-semibold text-[var(--ink)]">Auto-destruction</p>
-                <p className="text-sm text-[var(--ink-soft)]">Expiration, nombre de vues limité, suppression automatique.</p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={focusComposer}
-                className="group relative overflow-hidden rounded-xl bg-[var(--primary)] px-6 py-3 text-lg font-semibold text-white shadow-[0_12px_26px_rgba(0,0,0,0.16)] transition duration-200 hover:-translate-y-0.5 hover:shadow-[0_18px_34px_rgba(0,0,0,0.18)] focus-visible:shadow-[var(--ring)]"
-              >
-                Envoyer un mot de passe
-                <span className="pointer-events-none absolute inset-0 opacity-0 transition duration-200 group-hover:opacity-20" style={{ background: 'linear-gradient(120deg, transparent, rgba(255,255,255,0.22), transparent)' }} />
+                Premium
               </button>
               <button
                 type="button"
-                onClick={link ? handleCopy : () => {
-                  if (!generatedPassword) generatePassword()
-                  handleCopyGenerated()
-                }}
-                className="rounded-full border border-[var(--line)] px-4 py-2 text-sm text-[var(--ink-soft)] transition duration-150 hover:border-[var(--primary)]"
+                onClick={() => handleSelectPlan('pro')}
+                className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
               >
-                {link ? 'Copier le lien actuel' : 'Générer un mot de passe'}
+                Pro
               </button>
-              <span className="text-sm text-[var(--ink-soft)]">Plus jamais de mot de passe en clair.</span>
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-3">
-              {[
-                { title: '1. Créer un mémo', desc: 'Collez le secret ou ajoutez un fichier.' },
-                { title: '2. Configurer', desc: 'Expiration, vues, passphrase optionnelle.' },
-                { title: '3. Partager', desc: 'Lien unique qui s’autodétruit après lecture.' },
-              ].map((step, index) => (
-                <div
-                  key={step.title}
-                  className="flex items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface)]/85 px-4 py-3 shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow)]"
-                >
-                  <span className="mt-1 h-7 w-7 rounded-full bg-[var(--primary-weak)] text-center text-sm font-semibold text-[var(--primary-strong)]">
-                    {index + 1}
-                  </span>
-                  <div className="flex flex-col">
-                    <p className="text-sm font-semibold text-[var(--ink)]">{step.title}</p>
-                    <p className="text-xs text-[var(--ink-soft)]">{step.desc}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Mode</p>
-                <p className="text-lg font-semibold text-[var(--ink)]">
-                  {mode === 'text' ? 'Texte' : 'Fichier'}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Expiration</p>
-                <p className="text-lg font-semibold text-[var(--ink)]">{expiresAtLabel}</p>
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Vues</p>
-                <p className="text-lg font-semibold text-[var(--ink)]">{views} max</p>
-              </div>
             </div>
           </div>
+        ) : null}
+
+        <div className="flex items-center justify-between border-b border-[var(--line)] px-6 py-4">
+          <div>
+            <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">Envoyer un secret</p>
+            <p className="text-sm text-[var(--ink-soft)]">Copie, lien, suppression automatique.</p>
+          </div>
+          <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
+            {status === 'working'
+              ? 'Chiffrement…'
+              : status === 'copied'
+                ? 'Copié'
+                : link
+                  ? 'Prêt'
+                  : 'En attente'}
+          </span>
         </div>
 
-        <section id="composer" className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow-strong)] backdrop-blur">
-          {paywallQuotaReached ? (
-            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-[var(--surface)]/92 backdrop-blur">
-              <p className="text-sm font-semibold text-[var(--ink)]">
-                Quota atteint sur ton plan actuel.
-              </p>
-              <p className="text-xs text-[var(--ink-soft)]">
-                Upgrade pour continuer à pousser sans limite.
-              </p>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => handleSelectPlan('premium')}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                >
-                  Passer en Premium
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleSelectPlan('pro')}
-                  className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
-                >
-                  Passer en Pro
-                </button>
-              </div>
+        <div className="flex flex-col gap-5 p-6">
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between text-xs text-[var(--ink-soft)]">
+              <span>Collez votre secret</span>
+              <span className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-[10px]">{label}</span>
             </div>
-          ) : null}
-          <div className="flex items-center justify-between border-b border-[var(--line)] px-6 py-4">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-                Composer
-              </p>
-              <p className="text-base font-semibold text-[var(--ink)]">Mémo sécurisé</p>
-            </div>
-            <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
-              {status === 'working'
-                ? 'Chiffrement…'
-                : status === 'ready' || status === 'autocopied'
-                  ? 'Lien prêt'
-                  : status === 'copied'
-                    ? 'Copié'
-                    : status === 'error'
-                      ? 'À vérifier'
-                      : 'En attente'}
-            </span>
+            <textarea
+              id="memo-area"
+              rows={5}
+              value={secret}
+              disabled={mode === 'file'}
+              onChange={(event) => {
+                setSecret(event.target.value)
+                setStatus('idle')
+              }}
+              placeholder="Texte, mot de passe, note..."
+              className="w-full resize-none rounded-xl border border-[var(--line)] bg-[var(--field)] px-4 py-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-60"
+            />
+            {fileError ? <p className="text-xs text-[var(--primary)]">{fileError}</p> : null}
           </div>
 
-          <div className="flex flex-col gap-5 p-6">
-            <div className="flex flex-wrap gap-3">
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('text')
-                  setFile(null)
-                  setFileError('')
-                }}
-                className={`rounded-xl border px-4 py-3 text-sm font-semibold transition ${
-                  mode === 'text'
-                    ?'border-[var(--primary)] bg-[var(--primary)] text-white'
-                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
-                }`}
-              >
-                Écrire un message
-              </button>
-              <label
-                className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-3 text-center text-xs transition ${
-                  mode === 'file'
-                    ?'border-[var(--primary)] bg-[var(--primary-weak)] text-[var(--primary)]'
-                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
-                }`}
-              >
-                <input
-                  type="file"
-                  className="hidden"
-                  onChange={(event) => {
-                    const selected = event.target.files?.[0]
-                    if (!selected) return
-                    const maxBytes = plan.maxFileBytes
-                    if (selected.size > maxBytes) {
-                      setFile(null)
-                      setFileError(`Fichier trop volumineux (max ${formatBytes(maxBytes)}).`)
-                      setMode('file')
-                      return
-                    }
-                    setFile(selected)
-                    setFileError('')
-                    setMode('file')
-                  }}
-                />
-                {file ?(
-                  <>
-                    <span className="font-semibold text-[var(--primary)]">
-                      {file.name}
-                    </span>
-                    <span className="mt-1 text-[10px] text-[var(--ink-soft)]">
-                      {formatBytes(file.size)}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    Importer un fichier
-                    <span className="mt-1 text-[10px] text-[var(--ink-soft)]">
-                      Taille max : {formatBytes(plan.maxFileBytes)}
-                    </span>
-                  </>
-                )}
-              </label>
-            </div>
-
-            <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Message
-                </label>
-                <span className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-[10px] text-[var(--ink-soft)]">
-                  {label}
-                </span>
-              </div>
-              <textarea
-                id="memo-area"
-                rows={4}
-                value={secret}
-                disabled={mode === 'file'}
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setMode('text')
+                setFile(null)
+                setFileError('')
+              }}
+              className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] transition ${
+                mode === 'text'
+                  ? 'border-[var(--primary)] bg-[var(--primary)] text-white'
+                  : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
+              }`}
+            >
+              Mode texte
+            </button>
+            <label className="flex cursor-pointer items-center gap-2 rounded-full border border-dashed border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]">
+              <input
+                type="file"
+                className="hidden"
                 onChange={(event) => {
-                  setSecret(event.target.value)
-                  setStatus('idle')
+                  const selected = event.target.files?.[0]
+                  if (!selected) return
+                  const maxBytes = plan.maxFileBytes
+                  if (selected.size > maxBytes) {
+                    setFile(null)
+                    setFileError(`Fichier trop volumineux (max ${formatBytes(maxBytes)}).`)
+                    setMode('file')
+                    return
+                  }
+                  setFile(selected)
+                  setFileError('')
+                  setMode('file')
                 }}
-                placeholder="Tape ton secret ou colle-le ici."
-                className="w-full resize-none rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-60"
               />
-              {fileError ?(
-                <p className="text-xs text-[var(--primary)]">{fileError}</p>
-              ) : null}
-            </div>
+              <span>{file ? file.name : 'Ajouter un fichier'}</span>
+              <span className="text-[10px] text-[var(--ink-soft)]">
+                {file ? formatBytes(file.size) : `Max ${formatBytes(plan.maxFileBytes)}`}
+              </span>
+            </label>
+          </div>
 
-            <div className="grid gap-4 lg:grid-cols-3">
-              <div className="flex flex-col gap-3 lg:col-span-2">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Expiration
-                </p>
-                <div className="flex flex-wrap gap-2">
-                  {presets.map((preset) => {
-                    const locked =
-                      preset.minPlan && planOrder[plan.plan] < planOrder[preset.minPlan]
-                    return (
-                      <button
-                        key={preset.label}
-                        type="button"
-                        onClick={() => {
-                          if (locked) {
-                            triggerUpgrade(
-                              `Durée ${preset.label} disponible en ${preset.minPlan === 'pro' ? 'Pro' : 'Premium'}.`,
-                            )
-                            return
-                          }
-                          setExpiry(preset.minutes)
-                        }}
-                        className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
-                          expiry === preset.minutes
-                            ?'border-[var(--primary)] bg-[var(--primary)] text-white'
-                            : locked
-                                ? 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] opacity-50'
-                                : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
-                        }`}
-                      >
-                        {preset.label}
-                        {locked ? ' · ' + preset.minPlan?.toUpperCase() : ''}
-                      </button>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="flex flex-col gap-2">
+              <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Expiration</label>
+              <select
+                value={expiry}
+                onChange={(event) => {
+                  const next = Number(event.target.value)
+                  const preset = presets.find((p) => p.minutes === next)
+                  const locked = preset?.minPlan && planOrder[plan.plan] < planOrder[preset.minPlan]
+                  if (locked) {
+                    triggerUpgrade(
+                      `Durée ${preset?.label ?? ''} disponible en ${preset?.minPlan === 'pro' ? 'Pro' : 'Premium'}.`,
                     )
-                  })}
-                </div>
-              </div>
-              <div className="flex flex-col gap-3">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Vues max
-                </p>
+                    return
+                  }
+                  setExpiry(next)
+                }}
+                className="w-full rounded-lg border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
+              >
+                {presets.map((preset) => {
+                  const locked = preset.minPlan && planOrder[plan.plan] < planOrder[preset.minPlan]
+                  return (
+                    <option key={preset.label} value={preset.minutes} disabled={locked}>
+                      {preset.label}
+                      {locked ? ` ? ${preset.minPlan?.toUpperCase()}` : ''}
+                    </option>
+                  )
+                })}
+              </select>
+              <p className="text-xs text-[var(--ink-soft)]">
+                Sera supprimé le {expiresAtLabel}.
+                {planOrder[plan.plan] < planOrder.pro ? ' Jusqu’à 7 jours en Pro.' : ''}
+              </p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Vues max</label>
+              <div className="flex items-center gap-2">
                 <input
                   type="number"
                   min={1}
@@ -1543,287 +1737,201 @@ function Home() {
                     const next = Number(event.target.value)
                     setViews(Math.min(plan.maxViews, Math.max(1, next)))
                   }}
-                  className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
+                  className="w-24 rounded-lg border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
                 />
-                <p className="text-xs text-[var(--ink-soft)]">Max {plan.maxViews} vues selon le plan.</p>
-              </div>
-            </div>
-
-            <div className="grid gap-3 lg:grid-cols-2">
-              <div className="flex flex-col gap-2">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Passphrase (option)
-                </p>
-                <input
-                  value={passphrase}
-                  onChange={(event) => setPassphrase(event.target.value)}
-                  className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
-                  placeholder="Ajoute une passphrase"
-                  type="password"
-                />
-              </div>
-              <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm text-[var(--ink-soft)]">
-                <p className="text-[11px] uppercase tracking-[0.2em]">Accès</p>
-                <p className="leading-relaxed">
-                  Lien + clé dans l'URL. Ajoute une passphrase pour une double barrière.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={handleGenerate}
-                  className="rounded-md bg-[var(--primary)] px-6 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-                >
-                  {status === 'working' ?'Chiffrement…' : 'Générer le lien'}
-                </button>
-                {status === 'error' ?(
-                  <p className="text-sm text-[var(--primary)]">
-                    Vérifie les champs ou réessaie.
-                  </p>
+                <span className="text-xs text-[var(--ink-soft)]">Max {plan.maxViews} sur ce plan.</span>
+                {plan.maxViews < 20 ? (
+                  <button
+                    type="button"
+                    onClick={() => triggerUpgrade('Jusqu’à 20 vues en Pro')}
+                    className="flex items-center gap-1 rounded-full border border-[var(--line)] px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                  >
+                    ?? Pro
+                  </button>
                 ) : null}
               </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm">
-                {link ? (
-                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            </div>
+          </div>
+
+          <details className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm text-[var(--ink-soft)]">
+            <summary className="cursor-pointer text-xs uppercase tracking-[0.2em] text-[var(--ink)]">Options avancées</summary>
+            <div className="mt-3 flex flex-col gap-2">
+              <label className="text-xs text-[var(--ink-soft)]">Passphrase (optionnel)</label>
+              <input
+                value={passphrase}
+                onChange={(event) => setPassphrase(event.target.value)}
+                className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
+                placeholder="Ajoutez un mot de passe pour ce lien"
+                type="password"
+              />
+              <p className="text-xs text-[var(--ink-soft)]">Nous ne voyons jamais votre passphrase.</p>
+            </div>
+          </details>
+
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleGenerate}
+                className="rounded-md bg-[var(--primary)] px-6 py-2 text-sm font-semibold text-white transition hover:opacity-90"
+              >
+                {status === 'working' ? 'Chiffrement…' : 'Générer le lien sécurisé'}
+              </button>
+              <span className="text-xs text-[var(--ink-soft)]">Expire {expiresAtLabel} • {views} vues max</span>
+            </div>
+            <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm">
+              {link ? (
+                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                  <div className="flex flex-col gap-1">
                     <span className="break-all text-[var(--ink)]">{link}</span>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={handleCopy}
-                        className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                      >
-                        Copier
-                      </button>
-                      <span className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                        {status === 'copied'
-                          ? 'Copié'
-                          : status === 'autocopied'
-                            ? 'Auto-copié'
-                            : 'Prêt'}
-                      </span>
-                    </div>
+                    <span className="text-xs text-[var(--ink-soft)]">Chiffré côté navigateur.</span>
                   </div>
-                ) : (
-                  <span className="text-[var(--ink-soft)]">
-                    Le lien apparaît ici après génération.
-                  </span>
-                )}
-              </div>
-            </div>
-          </div>
-        </section>
-      </section>
-
-      <section className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
-        <div className="card rounded-2xl px-5 py-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-                Historique
-              </p>
-              <p className="text-base font-semibold text-[var(--ink)]">Derniers mémos</p>
-            </div>
-            <button
-              type="button"
-              onClick={refreshHistory}
-              className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
-            >
-              Rafraîchir
-            </button>
-          </div>
-          <div className="mt-3 flex flex-col gap-2">
-            {history.length === 0 ?(
-              <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)]">
-                Rien pour l'instant.
-              </div>
-            ) : (
-              history.map((item) => (
-                <Link
-                  key={item.id}
-                  to={`/push/${item.id}`}
-                  className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 transition hover:border-[var(--primary)]"
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold text-[var(--ink)]">{item.label}</p>
-                      <p className="text-xs text-[var(--ink-soft)]">
-                        Expire {item.expiresAtText} • {item.viewsLeft} vues restantes
-                      </p>
-                    </div>
-                    <span className="pill border border-[var(--line)] bg-[var(--surface)] px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                      {item.requiresPassphrase ? 'Passphrase' : 'Clé URL'}
-                    </span>
-                  </div>
-                </Link>
-              ))
-            )}
-          </div>
-        </div>
-
-        <div className="card rounded-2xl px-5 py-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-                Mot de passe
-              </p>
-              <p className="text-base font-semibold text-[var(--ink)]">Générateur express</p>
-            </div>
-          </div>
-
-          <div className="mt-4">
-            <div className="rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-3 py-3">
-              <div className="flex flex-col gap-3">
-                <input
-                  value={generatedPassword}
-                  readOnly
-                  className="w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                  placeholder="Génère et copie en 1 clic"
-                />
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
-                    <span>Longueur</span>
-                    <input
-                      type="range"
-                      min={12}
-                      max={48}
-                      value={passwordLength}
-                      onChange={(event) => {
-                        const next = Number(event.target.value)
-                        setPasswordLength(next)
-                        generatePassword(next)
-                      }}
-                    />
-                    <span className="min-w-[2ch] text-right">{passwordLength}</span>
-                  </div>
-                  <div className="flex gap-2">
+                  <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => generatePassword()}
-                      className="pill border border-[var(--primary)] bg-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-white transition hover:opacity-90"
-                    >
-                      Générer
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleCopyGenerated}
-                      className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                      onClick={handleCopy}
+                      className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
                     >
                       Copier
                     </button>
+                    <button
+                      type="button"
+                      onClick={resetComposer}
+                      className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                    >
+                      Nouveau secret
+                    </button>
                   </div>
                 </div>
-                <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={useUpper}
-                      onChange={(event) => setUseUpper(event.target.checked)}
-                    />
-                    Majuscules
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={useLower}
-                      onChange={(event) => setUseLower(event.target.checked)}
-                    />
-                    Minuscules
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={useNumbers}
-                      onChange={(event) => setUseNumbers(event.target.checked)}
-                    />
-                    Chiffres
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={useSymbols}
-                      onChange={(event) => setUseSymbols(event.target.checked)}
-                    />
-                    Symboles
-                  </label>
+              ) : (
+                <span className="text-[var(--ink-soft)]">Le lien apparaît ici après génération.</span>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <details className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
+        <summary className="cursor-pointer text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">Historique récent</summary>
+        <div className="mt-3 flex items-center justify-between">
+          <p className="text-sm text-[var(--ink-soft)]">Derniers liens accessibles depuis cet appareil.</p>
+          <button
+            type="button"
+            onClick={refreshHistory}
+            className="rounded-full border border-[var(--line)] px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+          >
+            Rafraîchir
+          </button>
+        </div>
+        <div className="mt-3 flex flex-col gap-2">
+          {history.length === 0 ? (
+            <div className="rounded-lg border border-[var(--line)] bg-[var(--surface)] px-4 py-2 text-sm text-[var(--ink-soft)]">
+              Aucun secret encore.
+            </div>
+          ) : (
+            history.map((item) => (
+              <Link
+                key={item.id}
+                to={`/push/${item.id}`}
+                className="rounded-lg border border-[var(--line)] bg-[var(--surface)] px-4 py-3 transition hover:border-[var(--primary)]"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-[var(--ink)]">{item.label}</p>
+                    <p className="text-xs text-[var(--ink-soft)]">
+                      Expire {item.expiresAtText} • {item.viewsLeft} vues restantes
+                    </p>
+                  </div>
+                  <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                    {item.requiresPassphrase ? 'Passphrase' : 'Clé URL'}
+                  </span>
                 </div>
+              </Link>
+            ))
+          )}
+        </div>
+      </details>
+
+      <details className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
+        <summary className="cursor-pointer text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">Outils (générateur de mot de passe)</summary>
+        <div className="mt-3 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-3 py-3">
+          <div className="flex flex-col gap-3">
+            <input
+              value={generatedPassword}
+              readOnly
+              className="w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+              placeholder="Génère et copie en 1 clic"
+            />
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
+                <span>Longueur</span>
+                <input
+                  type="range"
+                  min={12}
+                  max={48}
+                  value={passwordLength}
+                  onChange={(event) => {
+                    const next = Number(event.target.value)
+                    setPasswordLength(next)
+                    generatePassword(next)
+                  }}
+                />
+                <span className="min-w-[2ch] text-right">{passwordLength}</span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => generatePassword()}
+                  className="pill border border-[var(--primary)] bg-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-white transition hover:opacity-90"
+                >
+                  Générer
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCopyGenerated}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
+                >
+                  Copier
+                </button>
               </div>
             </div>
-          </div>
-        </div>
-      </section>
-
-      <section className="grid gap-5 lg:grid-cols-2">
-        <div className="card rounded-2xl px-5 py-5">
-          <div className="flex items-start justify-between">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-                Nouveau coffre-fort natif
-              </p>
-              <p className="text-base font-semibold text-[var(--ink)]">
-                Interface de coffre moderne, 100% Nemosyne
-              </p>
-              <p className="text-xs text-[var(--ink-soft)]">
-                Multi-colonnes, TOTP live, passkeys, mode voyage, générateur intégré.
-              </p>
+            <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useUpper}
+                  onChange={(event) => setUseUpper(event.target.checked)}
+                />
+                Majuscules
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useLower}
+                  onChange={(event) => setUseLower(event.target.checked)}
+                />
+                Minuscules
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useNumbers}
+                  onChange={(event) => setUseNumbers(event.target.checked)}
+                />
+                Chiffres
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={useSymbols}
+                  onChange={(event) => setUseSymbols(event.target.checked)}
+                />
+                Symboles
+              </label>
             </div>
-            <span className="pill border border-[var(--primary)] bg-[var(--primary-weak)] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-[var(--ink)]">
-              Beta
-            </span>
-          </div>
-          <ul className="mt-3 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
-            <li>Chiffrement AES-GCM + dérivation PBKDF2 côté client, sans dépendance externe.</li>
-            <li>Types : connexions, cartes, identités, notes, Wi‑Fi, SSH, API, passkeys.</li>
-            <li>Watchtower natif : faibles/recyclés, expirations, périmètre voyage.</li>
-          </ul>
-          <Link
-            to="/vault"
-            className="mt-4 inline-flex w-fit items-center justify-center rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
-          >
-            Ouvrir la nouvelle interface
-          </Link>
-        </div>
-
-        <div className="card rounded-2xl px-5 py-5">
-          <div className="flex items-start justify-between">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-                Pour les équipes et voyages
-              </p>
-              <p className="text-base font-semibold text-[var(--ink)]">Partage, audit, mode voyage</p>
-              <p className="text-xs text-[var(--ink-soft)]">
-                Prépare la synchro multi-appareils et l’API d’automatisation.
-              </p>
-            </div>
-            <span className="pill border border-[var(--primary)] bg-[var(--surface-muted)] px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-              R&D
-            </span>
-          </div>
-          <ul className="mt-3 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
-            <li>Mode voyage : masque instantanément les éléments non marqués « safe ».</li>
-            <li>Journal local + historique par item (rotations, copies, révocations).</li>
-            <li>API/Bot à venir pour provisionner les vaults d’équipe.</li>
-          </ul>
-          <div className="mt-4 flex gap-2">
-            <Link
-              to="/vault"
-              className="rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
-            >
-              Tester le coffre
-            </Link>
-            <button
-              type="button"
-              onClick={() => triggerUpgrade('Roadmap coffre natif')}
-              className="rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] hover:border-[var(--primary)]"
-            >
-              Voir la roadmap
-            </button>
           </div>
         </div>
-      </section>
-
+      </details>
 
       {toast ? (
         <div className="fixed bottom-6 right-6 z-50">
@@ -1904,6 +2012,10 @@ function PushView() {
 
   const handleReveal = async () => {
     if (!item || !id) return
+    if (status === 'revealed' || status === 'consumed') {
+      showToast('Secret déjà révélé dans cet onglet.', 'info')
+      return
+    }
     if (typeof window !== 'undefined' && (!window.isSecureContext || !crypto?.subtle)) {
       setStatus('error')
       showToast('Le chiffrement nécessite HTTPS ou localhost.', 'error')
@@ -2059,9 +2171,16 @@ function PushView() {
               <button
                 type="button"
                 onClick={handleReveal}
-                className="rounded-md bg-[var(--primary)] px-6 py-2 text-sm font-semibold text-white transition hover:opacity-90"
+                disabled={status === 'revealed' || status === 'consumed'}
+                className={`rounded-md px-6 py-2 text-sm font-semibold transition ${
+                  status === 'revealed' || status === 'consumed'
+                    ? 'cursor-not-allowed bg-[var(--line)] text-[var(--ink-soft)]'
+                    : 'bg-[var(--primary)] text-white hover:opacity-90'
+                }`}
               >
-                Révéler le secret
+                {status === 'revealed' || status === 'consumed'
+                  ? 'Déjà révélé'
+                  : 'Révéler le secret'}
               </button>
               {status === 'error' ?(
                 <p className="text-sm text-[var(--primary)]">
@@ -2150,46 +2269,136 @@ function NotFound() {
   )
 }
 
+
+
 function VerifyEmail() {
   const location = useLocation()
-  const [status, setStatus] = useState<'loading' | 'ok' | 'error'>('loading')
+  const navigate = useNavigate()
+  const [status, setStatus] = useState<'loading' | 'ok' | 'error' | 'reset'>('loading')
+  const [message, setMessage] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [updating, setUpdating] = useState(false)
 
   useEffect(() => {
-    const token = new URLSearchParams(location.search).get('token')
-    if (!token) {
-      setStatus('error')
-      return
-    }
+    const params = new URLSearchParams(location.search)
+    const code = params.get('code')
+    const type = params.get('type')
+    const legacyToken = params.get('token')
     const verify = async () => {
-      try {
-        await apiRequest(`/api/auth/verify?token=${encodeURIComponent(token)}`)
+      if (code) {
+        const { data, error } = await supabase.auth.exchangeCodeForSession(code)
+        if (error) {
+          setStatus('error')
+          setMessage('Lien invalide ou expiré.')
+          return
+        }
+        const session = data.session
+        if (session?.access_token) {
+          try {
+            await apiRequest('/api/auth/supabase-sync', {
+              method: 'POST',
+              body: JSON.stringify({ accessToken: session.access_token }),
+            })
+          } catch {
+            // ignore sync errors
+          }
+        }
+        if (type === 'recovery') {
+          setStatus('reset')
+          setMessage('Choisis un nouveau mot de passe pour finaliser la récupération.')
+          return
+        }
         setStatus('ok')
-      } catch {
-        setStatus('error')
+        setMessage('Email vérifié. Tu es connecté.')
+        return
       }
+      if (legacyToken) {
+        try {
+          await apiRequest(`/api/auth/verify?token=${encodeURIComponent(legacyToken)}`)
+          setStatus('ok')
+          setMessage('Email vérifié.')
+        } catch {
+          setStatus('error')
+          setMessage('Lien invalide ou expiré.')
+        }
+        return
+      }
+      setStatus('error')
+      setMessage('Lien invalide.')
     }
     verify()
   }, [location.search])
 
+  const handlePasswordUpdate = async () => {
+    if (newPassword.trim().length < 12) {
+      setMessage('Mot de passe trop court (12 caractères mini).')
+      return
+    }
+    setUpdating(true)
+    const { error } = await supabase.auth.updateUser({ password: newPassword.trim() })
+    if (error) {
+      setMessage('Impossible de mettre à jour le mot de passe.')
+      setUpdating(false)
+      return
+    }
+    const session = (await supabase.auth.getSession()).data.session
+    if (session?.access_token) {
+      try {
+        await apiRequest('/api/auth/supabase-sync', {
+          method: 'POST',
+          body: JSON.stringify({ accessToken: session.access_token }),
+        })
+      } catch {
+        // ignore
+      }
+    }
+    setStatus('ok')
+    setMessage('Mot de passe mis à jour et session active.')
+    setUpdating(false)
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-[1100px] flex-col gap-4 px-4 sm:px-6">
-      <h1 className="text-3xl font-semibold">Vérification email</h1>
-      {status === 'loading' ?(
+      <h1 className="text-3xl font-semibold">Validation & récupération</h1>
+      {status === 'loading' ? (
         <p className="text-sm text-[var(--ink-soft)]">Vérification en cours…</p>
       ) : null}
-      {status === 'ok' ?(
-        <p className="text-sm text-[var(--ink-soft)]">
-          Email vérifié. Vous pouvez vous connecter.
-        </p>
+      {status === 'ok' ? (
+        <p className="text-sm text-[var(--ink-soft)]">{message || 'Email vérifié.'}</p>
       ) : null}
-      {status === 'error' ?(
-        <p className="text-sm text-[var(--ink-soft)]">
-          Lien invalide ou expiré.
-        </p>
+      {status === 'error' ? (
+        <p className="text-sm text-[var(--ink-soft)]">{message || 'Lien invalide ou expiré.'}</p>
       ) : null}
-      <Link to="/" className="text-sm text-[var(--primary)]">
+      {status === 'reset' ? (
+        <div className="flex flex-col gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-4">
+          <p className="text-sm text-[var(--ink-soft)]">
+            Définis un nouveau mot de passe (Supabase Auth).
+          </p>
+          <input
+            type="password"
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+            placeholder="Nouveau mot de passe (>=12 caractères)"
+            className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+          />
+          <button
+            type="button"
+            onClick={handlePasswordUpdate}
+            disabled={updating}
+            className="w-fit rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+          >
+            Mettre à jour le mot de passe
+          </button>
+          {message ? <p className="text-xs text-[var(--ink-soft)]">{message}</p> : null}
+        </div>
+      ) : null}
+      <button
+        type="button"
+        onClick={() => navigate('/')}
+        className="w-fit text-sm text-[var(--primary)]"
+      >
         Retour à l’accueil
-      </Link>
+      </button>
     </div>
   )
 }
