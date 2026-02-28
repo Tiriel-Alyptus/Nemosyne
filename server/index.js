@@ -331,10 +331,43 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex')
 }
 
-function getRequestBase(req) {
-  if (process.env.APP_URL) {
-    return process.env.APP_URL.replace(/\/$/, '')
+function normalizeBaseUrl(value, defaultProtocol = 'https') {
+  if (typeof value !== 'string' || !value.trim()) return null
+  const trimmed = value.trim().replace(/\/$/, '')
+  const withProtocol = /^https?:\/\//i.test(trimmed)
+    ? trimmed
+    : `${defaultProtocol}://${trimmed}`
+  try {
+    return new URL(withProtocol).origin
+  } catch {
+    return null
   }
+}
+
+function isLocalOrigin(value) {
+  try {
+    const origin = new URL(value)
+    return ['localhost', '127.0.0.1', '::1'].includes(origin.hostname)
+  } catch {
+    return false
+  }
+}
+
+function getRequestBase(req) {
+  const explicitAppUrl = normalizeBaseUrl(process.env.APP_URL, 'http')
+  if (explicitAppUrl && !(isProd && isLocalOrigin(explicitAppUrl))) {
+    return explicitAppUrl
+  }
+
+  if (isProd) {
+    const productionDomain = normalizeBaseUrl(
+      process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    )
+    if (productionDomain) {
+      return productionDomain
+    }
+  }
+
   const forwardedProto = req.headers['x-forwarded-proto']
   const forwardedHost = req.headers['x-forwarded-host']
   const proto = Array.isArray(forwardedProto)
@@ -344,6 +377,13 @@ function getRequestBase(req) {
     ? forwardedHost[0]
     : forwardedHost || req.headers.host
   if (!host) {
+    const deploymentUrl = normalizeBaseUrl(process.env.VERCEL_URL)
+    if (deploymentUrl) {
+      return deploymentUrl
+    }
+    if (explicitAppUrl) {
+      return explicitAppUrl
+    }
     return appUrl.replace(/\/$/, '')
   }
   return `${proto}://${host}`.replace(/\/$/, '')
