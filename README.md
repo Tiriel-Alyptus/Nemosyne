@@ -115,3 +115,19 @@ Notes:
 - `SMTP_PORT=465` implique TLS (`secure: true`).
 - `SMTP_PORT=587` fonctionne aussi (`secure: false`).
 - En dev, si l'envoi echoue, l'API retourne un `verificationEmailPreviewLink` pour tester le parcours.
+
+## Chiffrement des champs BDD (anti-leak)
+
+Les metadonnees sensibles sont chiffrees cote serveur avant ecriture en base (email utilisateur, label/filename/mime des pushes).
+
+Variable recommandee:
+
+```bash
+DATA_ENCRYPTION_KEY=une-cle-secrete-longue-et-stable
+```
+
+Notes:
+
+- Si `DATA_ENCRYPTION_KEY` n'est pas definie, le serveur derive une cle depuis `SESSION_SECRET`.
+- En production, utilisez une valeur stable et robuste pour conserver la capacite de dechiffrement apres redeploiement.
+- L'initialisation DB (`RUN_MIGRATIONS=true`) effectue le backfill des emails existants vers le format chiffre + hash de recherche.

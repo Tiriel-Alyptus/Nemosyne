@@ -27,6 +27,12 @@ const cookieSecure = process.env.COOKIE_SECURE === 'true' || isProd
 const sessionSecret =
   process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex')
 const appUrl = process.env.APP_URL || `http://localhost:${port}`
+const fieldCryptoSeed = process.env.DATA_ENCRYPTION_KEY || sessionSecret
+const fieldCryptoKey = crypto
+  .createHash('sha256')
+  .update(fieldCryptoSeed)
+  .digest()
+const fieldCipherVersion = 'enc-v1'
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) {
@@ -62,7 +68,13 @@ async function initDb() {
       verify_token_expires_at bigint,
       mfa_enabled boolean NOT NULL DEFAULT FALSE,
       mfa_secret text,
-      mfa_temp_secret text
+      mfa_temp_secret text,
+      display_name text,
+      avatar_url text,
+      ui_theme text NOT NULL DEFAULT 'light',
+      ui_density text NOT NULL DEFAULT 'comfortable',
+      ui_language text NOT NULL DEFAULT 'fr',
+      notif_email boolean NOT NULL DEFAULT TRUE
     );
     CREATE TABLE IF NOT EXISTS sessions (
       id uuid PRIMARY KEY,
@@ -92,6 +104,44 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_pushes_expiry ON pushes(expires_at_ts);
     CREATE INDEX IF NOT EXISTS idx_users_verify_hash ON users(verify_token_hash);
   `)
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS email_hash text;
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS display_name text;
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS avatar_url text;
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS ui_theme text NOT NULL DEFAULT 'light';
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS ui_density text NOT NULL DEFAULT 'comfortable';
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS ui_language text NOT NULL DEFAULT 'fr';
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS notif_email boolean NOT NULL DEFAULT TRUE;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_hash ON users(email_hash);
+  `)
+
+  // One-time backfill: replace clear-text emails with encrypted values and add lookup hash.
+  const usersResult = await pool.query('SELECT id, email, email_hash FROM users')
+  for (const row of usersResult.rows) {
+    const rawEmail = typeof row.email === 'string' ? row.email : ''
+    if (!rawEmail) continue
+    const decryptedEmail = decryptField(rawEmail) || rawEmail
+    const normalizedEmail = decryptedEmail.toLowerCase().trim()
+    if (!normalizedEmail) continue
+    const nextEncryptedEmail = isEncryptedField(rawEmail)
+      ? rawEmail
+      : encryptField(normalizedEmail)
+    const nextEmailHash = row.email_hash || hashLookup(normalizedEmail)
+    if (nextEncryptedEmail !== rawEmail || nextEmailHash !== row.email_hash) {
+      await pool.query(
+        'UPDATE users SET email = $1, email_hash = $2 WHERE id = $3',
+        [nextEncryptedEmail, nextEmailHash, row.id],
+      )
+    }
+  }
 }
 
 const dbReady = shouldMigrate
@@ -217,12 +267,26 @@ const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const minPasswordLength = 12
 const maxPasswordLength = 128
 const verifyTokenTtlMs = 1000 * 60 * 60
+const maxDisplayNameLength = 80
+const maxAvatarUrlLength = 2048
+const allowedUiThemes = new Set(['light', 'dark'])
+const allowedUiDensities = new Set(['comfortable', 'compact'])
+const allowedUiLanguages = new Set(['fr', 'en'])
 
 function mapUser(row) {
   if (!row) return null
+  const decryptedEmail = decryptField(row.email)
+  const uiTheme = allowedUiThemes.has(row.ui_theme) ? row.ui_theme : 'light'
+  const uiDensity = allowedUiDensities.has(row.ui_density)
+    ? row.ui_density
+    : 'comfortable'
+  const uiLanguage = allowedUiLanguages.has(row.ui_language)
+    ? row.ui_language
+    : 'fr'
   return {
     id: row.id,
-    email: row.email,
+    email: decryptedEmail || row.email,
+    emailHash: row.email_hash,
     passwordHash: row.password_hash,
     createdAtTs: Number(row.created_at_ts),
     verified: row.verified,
@@ -233,6 +297,79 @@ function mapUser(row) {
     mfaEnabled: row.mfa_enabled,
     mfaSecret: row.mfa_secret,
     mfaTempSecret: row.mfa_temp_secret,
+    displayName: typeof row.display_name === 'string' ? row.display_name : null,
+    avatarUrl: typeof row.avatar_url === 'string' ? row.avatar_url : null,
+    uiTheme,
+    uiDensity,
+    uiLanguage,
+    notifEmail: row.notif_email !== false,
+  }
+}
+
+function normalizeDisplayName(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return trimmed.slice(0, maxDisplayNameLength)
+}
+
+function normalizeAvatarUrl(value) {
+  if (value === null) return { ok: true, value: null }
+  if (typeof value !== 'string') return { ok: false }
+  const trimmed = value.trim()
+  if (!trimmed) return { ok: true, value: null }
+  if (trimmed.length > maxAvatarUrlLength) return { ok: false }
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return { ok: false }
+    }
+    return { ok: true, value: parsed.toString() }
+  } catch {
+    return { ok: false }
+  }
+}
+
+function normalizeUiTheme(value) {
+  if (typeof value !== 'string') return null
+  return allowedUiThemes.has(value) ? value : null
+}
+
+function normalizeUiDensity(value) {
+  if (typeof value !== 'string') return null
+  return allowedUiDensities.has(value) ? value : null
+}
+
+function normalizeUiLanguage(value) {
+  if (typeof value !== 'string') return null
+  return allowedUiLanguages.has(value) ? value : null
+}
+
+function mapUserPreferences(user) {
+  return {
+    theme: user?.uiTheme || 'light',
+    density: user?.uiDensity || 'comfortable',
+    language: user?.uiLanguage || 'fr',
+    emailNotifications: user?.notifEmail !== false,
+  }
+}
+
+function buildSessionResponse(session, user) {
+  return {
+    authenticated: Boolean(user),
+    email: user?.email ?? null,
+    ownerType: session.ownerType,
+    verified: user?.verified ?? false,
+    mfaEnabled: user?.mfaEnabled ?? false,
+    user: user
+      ? {
+          id: user.id,
+          email: user.email,
+          displayName: user.displayName,
+          avatarUrl: user.avatarUrl,
+          preferences: mapUserPreferences(user),
+        }
+      : null,
   }
 }
 
@@ -249,12 +386,15 @@ function mapSession(row) {
 
 function mapPush(row) {
   if (!row) return null
+  const decryptedLabel = decryptField(row.label)
+  const decryptedFilename = decryptField(row.filename)
+  const decryptedMime = decryptField(row.mime)
   return {
     id: row.id,
     ownerType: row.owner_type,
     ownerId: row.owner_id,
     kind: row.kind,
-    label: row.label,
+    label: decryptedLabel || 'Secret',
     createdAtTs: Number(row.created_at_ts),
     expiresAtTs: Number(row.expires_at_ts),
     viewsLeft: row.views_left,
@@ -262,8 +402,8 @@ function mapPush(row) {
     iv: row.iv,
     salt: row.salt,
     requiresPassphrase: row.requires_passphrase,
-    filename: row.filename,
-    mime: row.mime,
+    filename: decryptedFilename || row.filename,
+    mime: decryptedMime || row.mime,
     size: row.size,
   }
 }
@@ -329,6 +469,46 @@ async function verifyPassword(hash, password) {
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex')
+}
+
+function hashLookup(value) {
+  return crypto
+    .createHmac('sha256', fieldCryptoKey)
+    .update(String(value || ''))
+    .digest('hex')
+}
+
+function isEncryptedField(value) {
+  return typeof value === 'string' && value.startsWith(`${fieldCipherVersion}:`)
+}
+
+function encryptField(value) {
+  if (typeof value !== 'string') return null
+  const plain = value.trim()
+  if (!plain) return null
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', fieldCryptoKey, iv)
+  const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return `${fieldCipherVersion}:${iv.toString('base64')}:${tag.toString('base64')}:${encrypted.toString('base64')}`
+}
+
+function decryptField(value) {
+  if (typeof value !== 'string' || !value) return null
+  if (!isEncryptedField(value)) return value
+  const parts = value.split(':')
+  if (parts.length !== 4) return null
+  try {
+    const iv = Buffer.from(parts[1], 'base64')
+    const tag = Buffer.from(parts[2], 'base64')
+    const cipherText = Buffer.from(parts[3], 'base64')
+    const decipher = crypto.createDecipheriv('aes-256-gcm', fieldCryptoKey, iv)
+    decipher.setAuthTag(tag)
+    const plain = Buffer.concat([decipher.update(cipherText), decipher.final()])
+    return plain.toString('utf8')
+  } catch {
+    return null
+  }
 }
 
 function normalizeBaseUrl(value, defaultProtocol = 'https') {
@@ -584,12 +764,130 @@ app.get('/api/session', async (req, res, next) => {
       )
       user = mapUser(result.rows[0])
     }
+    return res.json(buildSessionResponse(session, user))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/user/settings', async (req, res, next) => {
+  try {
+    const session = req.session
+    if (session.ownerType !== 'user') {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
+    const result = await pool.query(
+      'SELECT * FROM users WHERE id = $1 LIMIT 1',
+      [session.ownerId],
+    )
+    const user = mapUser(result.rows[0])
+    if (!user) {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
     return res.json({
-      authenticated: Boolean(user),
-      email: user?.email ?? null,
-      ownerType: session.ownerType,
-      verified: user?.verified ?? false,
-      mfaEnabled: user?.mfaEnabled ?? false,
+      ok: true,
+      displayName: user.displayName,
+      avatarUrl: user.avatarUrl,
+      preferences: mapUserPreferences(user),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/user/settings', authLimiter, async (req, res, next) => {
+  try {
+    const session = req.session
+    if (session.ownerType !== 'user') {
+      return res.status(401).json({ error: 'unauthorized' })
+    }
+    const payload =
+      req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? req.body
+        : {}
+    const updates = []
+    const values = []
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'displayName')) {
+      if (
+        payload.displayName !== null &&
+        typeof payload.displayName !== 'string'
+      ) {
+        return res.status(400).json({ error: 'invalid-display-name' })
+      }
+      values.push(normalizeDisplayName(payload.displayName || ''))
+      updates.push(`display_name = $${values.length}`)
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'avatarUrl')) {
+      const normalizedAvatar = normalizeAvatarUrl(payload.avatarUrl)
+      if (!normalizedAvatar.ok) {
+        return res.status(400).json({ error: 'invalid-avatar-url' })
+      }
+      values.push(normalizedAvatar.value ?? null)
+      updates.push(`avatar_url = $${values.length}`)
+    }
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'preferences')) {
+      const preferences = payload.preferences
+      if (
+        !preferences ||
+        typeof preferences !== 'object' ||
+        Array.isArray(preferences)
+      ) {
+        return res.status(400).json({ error: 'invalid-preferences' })
+      }
+      if (Object.prototype.hasOwnProperty.call(preferences, 'theme')) {
+        const nextTheme = normalizeUiTheme(preferences.theme)
+        if (!nextTheme) {
+          return res.status(400).json({ error: 'invalid-theme' })
+        }
+        values.push(nextTheme)
+        updates.push(`ui_theme = $${values.length}`)
+      }
+      if (Object.prototype.hasOwnProperty.call(preferences, 'density')) {
+        const nextDensity = normalizeUiDensity(preferences.density)
+        if (!nextDensity) {
+          return res.status(400).json({ error: 'invalid-density' })
+        }
+        values.push(nextDensity)
+        updates.push(`ui_density = $${values.length}`)
+      }
+      if (Object.prototype.hasOwnProperty.call(preferences, 'language')) {
+        const nextLanguage = normalizeUiLanguage(preferences.language)
+        if (!nextLanguage) {
+          return res.status(400).json({ error: 'invalid-language' })
+        }
+        values.push(nextLanguage)
+        updates.push(`ui_language = $${values.length}`)
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(preferences, 'emailNotifications')
+      ) {
+        if (typeof preferences.emailNotifications !== 'boolean') {
+          return res.status(400).json({ error: 'invalid-email-notifications' })
+        }
+        values.push(preferences.emailNotifications)
+        updates.push(`notif_email = $${values.length}`)
+      }
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'no-settings-updated' })
+    }
+
+    values.push(session.ownerId)
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${values.length} RETURNING *`
+    const updateResult = await pool.query(query, values)
+    const updatedUser = mapUser(updateResult.rows[0])
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'user-not-found' })
+    }
+    return res.json({
+      ok: true,
+      displayName: updatedUser.displayName,
+      avatarUrl: updatedUser.avatarUrl,
+      preferences: mapUserPreferences(updatedUser),
     })
   } catch (error) {
     next(error)
@@ -597,8 +895,17 @@ app.get('/api/session', async (req, res, next) => {
 })
 
 app.post('/api/auth/register', authLimiter, async (req, res) => {
-  const { email, password } = req.body || {}
+  const { email, password, fullName } = req.body || {}
   const normalizedEmail = typeof email === 'string' ? email.toLowerCase().trim() : ''
+  const normalizedEmailHash = hashLookup(normalizedEmail)
+  if (
+    fullName !== undefined &&
+    fullName !== null &&
+    typeof fullName !== 'string'
+  ) {
+    return res.status(400).json({ error: 'invalid-full-name' })
+  }
+  const normalizedDisplayName = normalizeDisplayName(fullName || '')
   if (!isValidEmail(normalizedEmail)) {
     return res.status(400).json({ error: 'invalid-email' })
   }
@@ -613,9 +920,10 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   ) {
     return res.status(400).json({ error: 'weak-password' })
   }
-  const existing = await pool.query('SELECT * FROM users WHERE email = $1 LIMIT 1', [
-    normalizedEmail,
-  ])
+  const existing = await pool.query(
+    'SELECT * FROM users WHERE email_hash = $1 OR email = $2 LIMIT 1',
+    [normalizedEmailHash, normalizedEmail],
+  )
   const existingUser = mapUser(existing.rows[0])
   if (existingUser) {
     if (existingUser.verified) {
@@ -624,8 +932,13 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const verifyToken = crypto.randomBytes(32).toString('hex')
     const verifyTokenHash = hashToken(verifyToken)
     await pool.query(
-      'UPDATE users SET verify_token_hash = $1, verify_token_expires_at = $2 WHERE id = $3',
-      [verifyTokenHash, Date.now() + verifyTokenTtlMs, existingUser.id],
+      'UPDATE users SET verify_token_hash = $1, verify_token_expires_at = $2, display_name = COALESCE($3, display_name) WHERE id = $4',
+      [
+        verifyTokenHash,
+        Date.now() + verifyTokenTtlMs,
+        normalizedDisplayName,
+        existingUser.id,
+      ],
     )
     const emailDelivery = await sendVerificationEmail(
       normalizedEmail,
@@ -649,9 +962,18 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   const userId = crypto.randomUUID()
   await pool.query(
     `INSERT INTO users
-      (id, email, password_hash, created_at_ts, verified, verify_token_hash, verify_token_expires_at, mfa_enabled, mfa_secret, mfa_temp_secret)
-     VALUES ($1, $2, $3, $4, FALSE, $5, $6, FALSE, NULL, NULL)`,
-    [userId, normalizedEmail, passwordHash, now, verifyTokenHash, now + verifyTokenTtlMs],
+      (id, email, email_hash, password_hash, created_at_ts, verified, verify_token_hash, verify_token_expires_at, mfa_enabled, mfa_secret, mfa_temp_secret, display_name)
+     VALUES ($1, $2, $3, $4, $5, FALSE, $6, $7, FALSE, NULL, NULL, $8)`,
+    [
+      userId,
+      encryptField(normalizedEmail),
+      normalizedEmailHash,
+      passwordHash,
+      now,
+      verifyTokenHash,
+      now + verifyTokenTtlMs,
+      normalizedDisplayName,
+    ],
   )
   const sessionId = crypto.randomUUID()
   await pool.query(
@@ -685,12 +1007,13 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   const { email, password, otp } = req.body || {}
   const normalizedEmail = typeof email === 'string' ? email.toLowerCase().trim() : ''
+  const normalizedEmailHash = hashLookup(normalizedEmail)
   if (!isValidEmail(normalizedEmail) || typeof password !== 'string') {
     return res.status(400).json({ error: 'invalid-credentials' })
   }
   const userResult = await pool.query(
-    'SELECT * FROM users WHERE email = $1 LIMIT 1',
-    [normalizedEmail],
+    'SELECT * FROM users WHERE email_hash = $1 OR email = $2 LIMIT 1',
+    [normalizedEmailHash, normalizedEmail],
   )
   const user = mapUser(userResult.rows[0])
   if (!user) {
@@ -737,12 +1060,13 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 app.post('/api/auth/resend-verification', verifyLimiter, async (req, res) => {
   const { email } = req.body || {}
   const normalizedEmail = typeof email === 'string' ? email.toLowerCase().trim() : ''
+  const normalizedEmailHash = hashLookup(normalizedEmail)
   if (!isValidEmail(normalizedEmail)) {
     return res.status(400).json({ error: 'invalid-email' })
   }
   const userResult = await pool.query(
-    'SELECT * FROM users WHERE email = $1 LIMIT 1',
-    [normalizedEmail],
+    'SELECT * FROM users WHERE email_hash = $1 OR email = $2 LIMIT 1',
+    [normalizedEmailHash, normalizedEmail],
   )
   const user = mapUser(userResult.rows[0])
   if (!user) {
@@ -934,7 +1258,7 @@ app.post('/api/push', createLimiter, async (req, res) => {
         payload.ownerType,
         payload.ownerId,
         payload.kind,
-        payload.label,
+        encryptField(payload.label),
         payload.createdAtTs,
         payload.expiresAtTs,
         payload.viewsLeft,
@@ -942,8 +1266,8 @@ app.post('/api/push', createLimiter, async (req, res) => {
         payload.iv,
         payload.salt ?? null,
         payload.requiresPassphrase,
-        payload.filename ?? null,
-        payload.mime ?? null,
+        payload.filename ? encryptField(payload.filename) : null,
+        payload.mime ? encryptField(payload.mime) : null,
         payload.size ?? null,
       ],
     )

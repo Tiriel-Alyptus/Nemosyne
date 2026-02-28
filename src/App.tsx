@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import logo from './assets/logo.svg'
 
@@ -29,6 +29,53 @@ type PushSummary = PushMeta & {
   isExpired: boolean
 }
 
+type AuthStatus =
+  | 'anonymous'
+  | 'checking'
+  | 'pending_email_verification'
+  | 'authenticated'
+
+type UserPreferences = {
+  theme: 'light' | 'dark'
+  density: 'comfortable' | 'compact'
+  language: 'fr' | 'en'
+  emailNotifications: boolean
+}
+
+type SessionSnapshot = {
+  authenticated: boolean
+  email: string | null
+  ownerType: 'anon' | 'user'
+  verified: boolean
+  mfaEnabled: boolean
+  user?: {
+    id: string
+    email: string
+    displayName: string | null
+    avatarUrl: string | null
+    preferences?: Partial<UserPreferences> | null
+  } | null
+}
+
+type AuthState = {
+  status: AuthStatus
+  authenticated: boolean
+  email: string | null
+  ownerType: 'anon' | 'user'
+  verified: boolean
+  mfaEnabled: boolean
+  userId: string | null
+  displayName: string | null
+  avatarUrl: string | null
+  preferences: UserPreferences
+}
+
+type AuthContextValue = {
+  auth: AuthState
+  refreshAuth: () => Promise<AuthState>
+  signalAuthChange: (reason: string) => void
+}
+
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -47,6 +94,27 @@ const quickViewPresets = [1, 5, 10]
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)
   ?.trim()
   .replace(/\/$/, '')
+const authSyncChannelName = 'nemosyne-auth-sync-v1'
+const authSyncStorageKey = 'nemosyne-auth-sync-event'
+const defaultUserPreferences: UserPreferences = {
+  theme: 'light',
+  density: 'comfortable',
+  language: 'fr',
+  emailNotifications: true,
+}
+const baseAnonymousAuth: AuthState = {
+  status: 'anonymous',
+  authenticated: false,
+  email: null,
+  ownerType: 'anon',
+  verified: false,
+  mfaEnabled: false,
+  userId: null,
+  displayName: null,
+  avatarUrl: null,
+  preferences: defaultUserPreferences,
+}
+const AuthContext = createContext<AuthContextValue | null>(null)
 
 function buildApiUrl(path: string) {
   if (/^https?:\/\//i.test(path)) return path
@@ -130,6 +198,174 @@ async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error(`api-${response.status}`)
   }
   return (await response.json()) as T
+}
+
+function toAuthStatus(snapshot: SessionSnapshot): AuthStatus {
+  if (!snapshot.authenticated || snapshot.ownerType !== 'user') {
+    return 'anonymous'
+  }
+  if (!snapshot.verified) {
+    return 'pending_email_verification'
+  }
+  return 'authenticated'
+}
+
+function toAuthState(snapshot: SessionSnapshot): AuthState {
+  const userPreferences = snapshot.user?.preferences || {}
+  return {
+    status: toAuthStatus(snapshot),
+    authenticated: snapshot.authenticated,
+    email: snapshot.email || null,
+    ownerType: snapshot.ownerType,
+    verified: snapshot.verified,
+    mfaEnabled: snapshot.mfaEnabled,
+    userId: snapshot.user?.id || null,
+    displayName: snapshot.user?.displayName || null,
+    avatarUrl: snapshot.user?.avatarUrl || null,
+    preferences: {
+      theme: userPreferences.theme === 'dark' ? 'dark' : 'light',
+      density:
+        userPreferences.density === 'compact'
+          ? 'compact'
+          : defaultUserPreferences.density,
+      language: userPreferences.language === 'en' ? 'en' : 'fr',
+      emailNotifications:
+        typeof userPreferences.emailNotifications === 'boolean'
+          ? userPreferences.emailNotifications
+          : defaultUserPreferences.emailNotifications,
+    },
+  }
+}
+
+function getInitials(value: string | null | undefined) {
+  if (!value) return 'U'
+  const parts = value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+  if (parts.length === 0) return 'U'
+  const first = parts[0]?.[0] || ''
+  const second = parts.length > 1 ? parts[1]?.[0] || '' : ''
+  const fallback = value.includes('@') ? value[0] || 'U' : ''
+  return `${first}${second || fallback}`.toUpperCase().slice(0, 2)
+}
+
+function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [auth, setAuth] = useState<AuthState>({ ...baseAnonymousAuth, status: 'checking' })
+  const authChannelRef = useRef<BroadcastChannel | null>(null)
+
+  const refreshAuth = useCallback(async () => {
+    try {
+      const session = await apiRequest<SessionSnapshot>('/api/session')
+      const next = toAuthState(session)
+      setAuth(next)
+      return next
+    } catch {
+      setAuth(baseAnonymousAuth)
+      return baseAnonymousAuth
+    }
+  }, [])
+
+  const signalAuthChange = useCallback((reason: string) => {
+    if (typeof window === 'undefined') return
+    const payload = {
+      reason,
+      ts: Date.now(),
+    }
+    try {
+      authChannelRef.current?.postMessage(payload)
+    } catch {
+      // noop
+    }
+    try {
+      window.localStorage.setItem(authSyncStorageKey, JSON.stringify(payload))
+    } catch {
+      // noop
+    }
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void refreshAuth()
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [refreshAuth])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    let channel: BroadcastChannel | null = null
+    if ('BroadcastChannel' in window) {
+      channel = new BroadcastChannel(authSyncChannelName)
+      authChannelRef.current = channel
+      channel.onmessage = () => {
+        void refreshAuth()
+      }
+    }
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== authSyncStorageKey || !event.newValue) return
+      void refreshAuth()
+    }
+    const onFocus = () => {
+      void refreshAuth()
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshAuth()
+      }
+    }
+
+    window.addEventListener('storage', onStorage)
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      window.removeEventListener('storage', onStorage)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      if (channel) {
+        channel.close()
+      }
+      authChannelRef.current = null
+    }
+  }, [refreshAuth])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const pollIntervalMs =
+      auth.status === 'pending_email_verification'
+        ? 7000
+        : auth.status === 'authenticated'
+          ? 15000
+          : 30000
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshAuth()
+      }
+    }, pollIntervalMs)
+    return () => window.clearInterval(timer)
+  }, [auth.status, refreshAuth])
+
+  return (
+    <AuthContext.Provider
+      value={{
+        auth,
+        refreshAuth,
+        signalAuthChange,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+function useAuthStore() {
+  const context = useContext(AuthContext)
+  if (!context) {
+    throw new Error('useAuthStore must be used within AuthProvider')
+  }
+  return context
 }
 
 async function deriveKey(passphrase: string, salt: ArrayBuffer) {
@@ -238,19 +474,13 @@ function toSummary(item: PushMeta): PushSummary {
 }
 
 function Home() {
+  const { auth, refreshAuth, signalAuthChange } = useAuthStore()
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     if (typeof window === 'undefined') return 'light'
     const stored = window.localStorage.getItem('theme')
     if (stored === 'light' || stored === 'dark') return stored
     return 'light' // interface blanche par défaut
   })
-  const [auth, setAuth] = useState<{
-    authenticated: boolean
-    email: string | null
-    ownerType: 'anon' | 'user'
-    verified?: boolean
-    mfaEnabled?: boolean
-  }>({ authenticated: false, email: null, ownerType: 'anon' })
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [otp, setOtp] = useState('')
@@ -295,6 +525,20 @@ function Home() {
     message: string
     kind: 'success' | 'error' | 'info'
   } | null>(null)
+  const [showUserMenu, setShowUserMenu] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
+  const [settingsName, setSettingsName] = useState('')
+  const [settingsAvatarUrl, setSettingsAvatarUrl] = useState('')
+  const [settingsTheme, setSettingsTheme] = useState<'light' | 'dark'>('light')
+  const [settingsDensity, setSettingsDensity] = useState<'comfortable' | 'compact'>(
+    'comfortable',
+  )
+  const [settingsLanguage, setSettingsLanguage] = useState<'fr' | 'en'>('fr')
+  const [settingsEmailNotifications, setSettingsEmailNotifications] = useState(true)
+  const [avatarLoadError, setAvatarLoadError] = useState(false)
+  const userMenuRef = useRef<HTMLDivElement | null>(null)
 
   const showToast = (message: string, kind: 'success' | 'error' | 'info' = 'info') => {
     setToast({ message, kind })
@@ -325,6 +569,9 @@ function Home() {
           ? 'A verifier'
           : 'En attente'
   const mainCtaLabel = status === 'working' ? 'Creation en cours...' : 'Creer le lien securise'
+  const userDisplayName = auth.displayName || auth.email || 'Utilisateur'
+  const userInitials = getInitials(userDisplayName)
+  const pendingEmailVerification = auth.status === 'pending_email_verification'
 
   const focusComposer = () => {
     const editor = document.getElementById('memo-area') as HTMLTextAreaElement | null
@@ -334,14 +581,6 @@ function Home() {
   useEffect(() => {
     const hydrate = async () => {
       try {
-        const session = await apiRequest<{
-          authenticated: boolean
-          email: string | null
-          ownerType: 'anon' | 'user'
-          verified: boolean
-          mfaEnabled: boolean
-        }>('/api/session')
-        setAuth(session)
         await apiRequest('/api/push/purge', { method: 'POST' })
         const data = await apiRequest<{ items: PushMeta[] }>('/api/push')
         setHistory(data.items.map(toSummary))
@@ -349,13 +588,25 @@ function Home() {
         setHistory([])
       }
     }
-    hydrate()
+    void hydrate()
   }, [])
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     window.localStorage.setItem('theme', theme)
   }, [theme])
+
+  useEffect(() => {
+    document.documentElement.dataset.density = auth.preferences.density
+    document.documentElement.lang = auth.preferences.language
+  }, [auth.preferences.density, auth.preferences.language])
+
+  useEffect(() => {
+    if (auth.authenticated) {
+      const nextTheme = auth.preferences.theme
+      setTheme((current) => (current === nextTheme ? current : nextTheme))
+    }
+  }, [auth.authenticated, auth.preferences.theme])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -370,16 +621,52 @@ function Home() {
     window.localStorage.setItem('auth-mode', authMode)
   }, [authMode])
 
+  useEffect(() => {
+    setAvatarLoadError(false)
+  }, [auth.avatarUrl])
+
+  useEffect(() => {
+    if (!showUserMenu) return
+    const onWindowClick = (event: MouseEvent) => {
+      if (!userMenuRef.current) return
+      if (!userMenuRef.current.contains(event.target as Node)) {
+        setShowUserMenu(false)
+      }
+    }
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowUserMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', onWindowClick)
+    document.addEventListener('keydown', onEscape)
+    return () => {
+      document.removeEventListener('mousedown', onWindowClick)
+      document.removeEventListener('keydown', onEscape)
+    }
+  }, [showUserMenu])
+
+  useEffect(() => {
+    if (!showSettings) return
+    setSettingsError('')
+    setSettingsName(auth.displayName || '')
+    setSettingsAvatarUrl(auth.avatarUrl || '')
+    setSettingsTheme(auth.preferences.theme)
+    setSettingsDensity(auth.preferences.density)
+    setSettingsLanguage(auth.preferences.language)
+    setSettingsEmailNotifications(auth.preferences.emailNotifications)
+  }, [
+    auth.avatarUrl,
+    auth.displayName,
+    auth.preferences.density,
+    auth.preferences.emailNotifications,
+    auth.preferences.language,
+    auth.preferences.theme,
+    showSettings,
+  ])
+
   const refreshHistory = async () => {
     try {
-      const session = await apiRequest<{
-        authenticated: boolean
-        email: string | null
-        ownerType: 'anon' | 'user'
-        verified: boolean
-        mfaEnabled: boolean
-      }>('/api/session')
-      setAuth(session)
       const data = await apiRequest<{ items: PushMeta[] }>('/api/push')
       setHistory(data.items.map(toSummary))
     } catch {
@@ -420,12 +707,13 @@ function Home() {
           body: JSON.stringify({ email, password, otp: otp || undefined }),
         },
       )
-      setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
       persistRememberedAuth(result.email)
       setPassword('')
       setOtp('')
       setAuthError('')
       setShowAuth(false)
+      await refreshAuth()
+      signalAuthChange('auth-login')
       await refreshHistory()
     } catch (error) {
       if (error instanceof Error && error.message.includes('mfa-required')) {
@@ -471,12 +759,11 @@ function Home() {
         '/api/auth/register',
         {
           method: 'POST',
-          body: JSON.stringify({ email, password }),
+          body: JSON.stringify({ email, password, fullName }),
         },
       )
       const isAuthenticated = Boolean(result.authenticated)
       if (isAuthenticated) {
-        setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
         persistRememberedAuth(result.email)
       }
       setPassword('')
@@ -503,6 +790,10 @@ function Home() {
         )
         showToast('Service email non disponible. Vérifiez la configuration SMTP.', 'error')
       }
+      await refreshAuth()
+      if (isAuthenticated) {
+        signalAuthChange('auth-register')
+      }
       await refreshHistory()
     } catch (error) {
       if (error instanceof Error && error.message.includes('api-409')) {
@@ -522,7 +813,8 @@ function Home() {
     setAuthError('')
     try {
       await apiRequest('/api/auth/logout', { method: 'POST' })
-      setAuth({ authenticated: false, email: null, ownerType: 'anon' })
+      await refreshAuth()
+      signalAuthChange('auth-logout')
       await refreshHistory()
     } catch {
       setAuthError('Déconnexion impossible.')
@@ -601,11 +893,43 @@ function Home() {
       setOtp('')
       setMfaSetup(false)
       setMfaQr(null)
+      await refreshAuth()
+      signalAuthChange('mfa-enabled')
       await refreshHistory()
     } catch {
       setAuthError('Code MFA invalide.')
     } finally {
       setAuthLoading(false)
+    }
+  }
+
+  const handleSaveSettings = async () => {
+    if (!auth.authenticated) return
+    setSettingsSaving(true)
+    setSettingsError('')
+    try {
+      await apiRequest('/api/user/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          displayName: settingsName,
+          avatarUrl: settingsAvatarUrl,
+          preferences: {
+            theme: settingsTheme,
+            density: settingsDensity,
+            language: settingsLanguage,
+            emailNotifications: settingsEmailNotifications,
+          },
+        }),
+      })
+      setTheme(settingsTheme)
+      await refreshAuth()
+      signalAuthChange('user-settings-updated')
+      setShowSettings(false)
+      showToast('Paramètres enregistrés.', 'success')
+    } catch {
+      setSettingsError('Impossible d’enregistrer les paramètres.')
+    } finally {
+      setSettingsSaving(false)
     }
   }
 
@@ -808,7 +1132,7 @@ function Home() {
                 onClick={() => setTheme('dark')}
                 className={`h-6 w-6 rounded-full border ${
                   theme === 'dark'
-                    ?'border-[var(--primary)] bg-[var(--primary)]'
+                    ? 'border-[var(--primary)] bg-[var(--primary)]'
                     : 'border-[var(--line)] bg-[var(--surface)]'
                 }`}
                 aria-label="Mode sombre"
@@ -818,41 +1142,133 @@ function Home() {
                 onClick={() => setTheme('light')}
                 className={`h-6 w-6 rounded-full border ${
                   theme === 'light'
-                    ?'border-[var(--primary)] bg-[var(--primary)]'
+                    ? 'border-[var(--primary)] bg-[var(--primary)]'
                     : 'border-[var(--line)] bg-[var(--surface)]'
                 }`}
                 aria-label="Mode clair"
               />
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                setAuthMode('signin')
-                setAuthError('')
-                setMfaRequired(false)
-                setOtp('')
-                setShowAuth(true)
-              }}
-              className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
-            >
-              Se connecter
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setAuthMode('signup')
-                setAuthError('')
-                setMfaRequired(false)
-                setOtp('')
-                setShowAuth(true)
-              }}
-              className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white transition hover:opacity-90"
-            >
-              S'inscrire
-            </button>
+
+            {auth.authenticated ? (
+              <div ref={userMenuRef} className="relative flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowUserMenu((current) => !current)}
+                  className="flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1.5 text-left"
+                  aria-haspopup="menu"
+                  aria-expanded={showUserMenu}
+                >
+                  <span className="inline-flex h-9 w-9 items-center justify-center overflow-hidden rounded-full bg-[var(--primary)] text-xs font-semibold uppercase text-white">
+                    {auth.avatarUrl && !avatarLoadError ? (
+                      <img
+                        src={auth.avatarUrl}
+                        alt={userDisplayName}
+                        className="h-full w-full object-cover"
+                        onError={() => setAvatarLoadError(true)}
+                      />
+                    ) : (
+                      userInitials
+                    )}
+                  </span>
+                  <span className="max-w-[170px] truncate text-sm font-semibold text-[var(--ink)]">
+                    {userDisplayName}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  disabled={authLoading}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)] disabled:opacity-60"
+                >
+                  Déconnexion
+                </button>
+
+                {showUserMenu ? (
+                  <div className="absolute right-0 top-full z-30 mt-2 w-60 rounded-2xl border border-[var(--line)] bg-[var(--surface)] p-2 shadow-[var(--shadow)]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowUserMenu(false)
+                        setShowSettings(true)
+                      }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-sm text-[var(--ink)] transition hover:bg-[var(--surface-muted)]"
+                    >
+                      Paramètres
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowUserMenu(false)
+                        showToast('Section profil à venir.', 'info')
+                      }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)]"
+                    >
+                      Profil
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowUserMenu(false)
+                        showToast('Section sécurité à venir.', 'info')
+                      }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)]"
+                    >
+                      Sécurité
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowUserMenu(false)
+                        showToast('Section préférences à venir.', 'info')
+                      }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)]"
+                    >
+                      Préférences
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin')
+                    setAuthError('')
+                    setMfaRequired(false)
+                    setOtp('')
+                    setShowAuth(true)
+                  }}
+                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
+                >
+                  Se connecter
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signup')
+                    setAuthError('')
+                    setMfaRequired(false)
+                    setOtp('')
+                    setShowAuth(true)
+                  }}
+                  className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white transition hover:opacity-90"
+                >
+                  S'inscrire
+                </button>
+              </>
+            )}
           </div>
         </div>
       </header>
+
+      {pendingEmailVerification ? (
+        <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-[var(--ink)]">
+          Email en attente de vérification. Ouvrez votre boîte mail puis cliquez sur le
+          lien de validation. Cette page se mettra à jour automatiquement.
+        </div>
+      ) : null}
 
 
       {showAuth ?(
@@ -1105,6 +1521,133 @@ function Home() {
                   </button>
                 </p>
               ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showSettings ? (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-[var(--bg-2)]/90 backdrop-blur-sm">
+          <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center px-4 py-10">
+            <div className="w-full rounded-3xl border border-[var(--line)] bg-[var(--surface)] p-6 shadow-[var(--shadow-strong)]">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                    Paramètres utilisateur
+                  </p>
+                  <h2 className="mt-1 text-2xl font-semibold">Expérience utilisateur</h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowSettings(false)}
+                  className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                >
+                  Fermer
+                </button>
+              </div>
+
+              <div className="mt-6 grid gap-4">
+                <label className="flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+                  Nom affiché
+                  <input
+                    value={settingsName}
+                    onChange={(event) => setSettingsName(event.target.value)}
+                    placeholder="Votre nom"
+                    className="rounded-xl border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                  />
+                </label>
+
+                <label className="flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+                  Avatar (URL)
+                  <input
+                    value={settingsAvatarUrl}
+                    onChange={(event) => setSettingsAvatarUrl(event.target.value)}
+                    placeholder="https://..."
+                    className="rounded-xl border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setSettingsAvatarUrl('')}
+                    className="w-fit rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                  >
+                    Supprimer l’avatar
+                  </button>
+                </label>
+
+                <div className="grid gap-3 md:grid-cols-3">
+                  <label className="flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+                    Thème
+                    <select
+                      value={settingsTheme}
+                      onChange={(event) => setSettingsTheme(event.target.value as 'light' | 'dark')}
+                      className="rounded-xl border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                    >
+                      <option value="light">Clair</option>
+                      <option value="dark">Sombre</option>
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+                    Densité
+                    <select
+                      value={settingsDensity}
+                      onChange={(event) =>
+                        setSettingsDensity(event.target.value as 'comfortable' | 'compact')
+                      }
+                      className="rounded-xl border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                    >
+                      <option value="comfortable">Confortable</option>
+                      <option value="compact">Compacte</option>
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
+                    Langue
+                    <select
+                      value={settingsLanguage}
+                      onChange={(event) => setSettingsLanguage(event.target.value as 'fr' | 'en')}
+                      className="rounded-xl border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
+                    >
+                      <option value="fr">Français</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                </div>
+
+                <label className="flex items-center gap-2 text-sm text-[var(--ink)]">
+                  <input
+                    type="checkbox"
+                    checked={settingsEmailNotifications}
+                    onChange={(event) => setSettingsEmailNotifications(event.target.checked)}
+                    className="h-4 w-4 rounded border-[var(--line)]"
+                  />
+                  Recevoir les notifications email
+                </label>
+
+                {settingsError ? (
+                  <p className="rounded-xl border border-red-400/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                    {settingsError}
+                  </p>
+                ) : null}
+
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowSettings(false)}
+                    className="pill border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                  >
+                    Annuler
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveSettings}
+                    disabled={settingsSaving}
+                    className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white disabled:opacity-60"
+                  >
+                    {settingsSaving ? 'Enregistrement...' : 'Enregistrer'}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1897,6 +2440,7 @@ function NotFound() {
 
 function VerifyEmail() {
   const location = useLocation()
+  const { auth, refreshAuth, signalAuthChange } = useAuthStore()
   const [status, setStatus] = useState<'loading' | 'ok' | 'error'>('loading')
 
   useEffect(() => {
@@ -1908,13 +2452,15 @@ function VerifyEmail() {
     const verify = async () => {
       try {
         await apiRequest(`/api/auth/verify?token=${encodeURIComponent(token)}`)
+        await refreshAuth()
+        signalAuthChange('email-verified')
         setStatus('ok')
       } catch {
         setStatus('error')
       }
     }
-    verify()
-  }, [location.search])
+    void verify()
+  }, [location.search, refreshAuth, signalAuthChange])
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
@@ -1924,7 +2470,11 @@ function VerifyEmail() {
       ) : null}
       {status === 'ok' ?(
         <p className="text-sm text-[var(--ink-soft)]">
-          Email vérifié. Vous pouvez vous connecter.
+          {auth.status === 'authenticated'
+            ? 'Email vérifié. Vous êtes connecté.'
+            : auth.status === 'pending_email_verification'
+              ? 'Email vérifié. Synchronisation de session en cours...'
+              : 'Email vérifié. Vous pouvez vous connecter.'}
         </p>
       ) : null}
       {status === 'error' ?(
@@ -2555,24 +3105,25 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen px-6 pb-14 pt-8 text-[var(--ink)] md:px-12">
-      <Routes>
-        <Route path="/" element={<Home />} />
-        <Route path="/push/:id" element={<PushView />} />
-        <Route path="/verify" element={<VerifyEmail />} />
-        <Route path="/features" element={<FeaturesPage />} />
-        <Route path="/pricing" element={<PricingPage />} />
-        <Route path="/api" element={<ApiDocsPage />} />
-        <Route path="/whats-new" element={<WhatsNewPage />} />
-        <Route path="/tools/passwords" element={<PasswordGeneratorPage />} />
-        <Route path="/tools/keys" element={<KeyGeneratorPage />} />
-        <Route path="/best-practices" element={<BestPracticesPage />} />
-        <Route path="/faq" element={<FaqPage />} />
-        <Route path="/privacy" element={<PrivacyPolicy />} />
-        <Route path="/terms" element={<TermsOfUse />} />
-        <Route path="/cookies" element={<CookiePolicy />} />
-        <Route path="*" element={<NotFound />} />
-      </Routes>
+    <AuthProvider>
+      <div className="min-h-screen px-6 pb-14 pt-8 text-[var(--ink)] md:px-12">
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/push/:id" element={<PushView />} />
+          <Route path="/verify" element={<VerifyEmail />} />
+          <Route path="/features" element={<FeaturesPage />} />
+          <Route path="/pricing" element={<PricingPage />} />
+          <Route path="/api" element={<ApiDocsPage />} />
+          <Route path="/whats-new" element={<WhatsNewPage />} />
+          <Route path="/tools/passwords" element={<PasswordGeneratorPage />} />
+          <Route path="/tools/keys" element={<KeyGeneratorPage />} />
+          <Route path="/best-practices" element={<BestPracticesPage />} />
+          <Route path="/faq" element={<FaqPage />} />
+          <Route path="/privacy" element={<PrivacyPolicy />} />
+          <Route path="/terms" element={<TermsOfUse />} />
+          <Route path="/cookies" element={<CookiePolicy />} />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
 
       <footer className="mt-16 rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-6 py-8">
         <div className="grid gap-8 md:grid-cols-5">
@@ -2703,38 +3254,39 @@ function App() {
         </span>
       </div>
 
-      {cookieChoice === null ? (
-        <div className="fixed bottom-5 left-1/2 z-50 w-[min(90vw,760px)] -translate-x-1/2 rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-5 py-4 shadow-lg">
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <p className="text-sm text-[var(--ink-soft)]">
-              Nous utilisons des cookies strictement nécessaires pour sécuriser votre
-              session et améliorer l’expérience. Vous pouvez accepter ou refuser.
-            </p>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => handleCookieChoice('refused')}
-                className="rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-              >
-                Refuser
-              </button>
-              <button
-                type="button"
-                onClick={() => handleCookieChoice('accepted')}
-                className="rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
-              >
-                Accepter
-              </button>
+        {cookieChoice === null ? (
+          <div className="fixed bottom-5 left-1/2 z-50 w-[min(90vw,760px)] -translate-x-1/2 rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-5 py-4 shadow-lg">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <p className="text-sm text-[var(--ink-soft)]">
+                Nous utilisons des cookies strictement nécessaires pour sécuriser votre
+                session et améliorer l’expérience. Vous pouvez accepter ou refuser.
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleCookieChoice('refused')}
+                  className="rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                >
+                  Refuser
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCookieChoice('accepted')}
+                  className="rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white"
+                >
+                  Accepter
+                </button>
+              </div>
+            </div>
+            <div className="mt-2 text-xs text-[var(--ink-soft)]">
+              <Link to="/cookies" className="text-[var(--primary)]">
+                Consulter la politique de cookies
+              </Link>
             </div>
           </div>
-          <div className="mt-2 text-xs text-[var(--ink-soft)]">
-            <Link to="/cookies" className="text-[var(--primary)]">
-              Consulter la politique de cookies
-            </Link>
-          </div>
-        </div>
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+    </AuthProvider>
   )
 }
 
