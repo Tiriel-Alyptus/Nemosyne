@@ -30,7 +30,7 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
-    strictPort: true,
+    strictPort: false,
     https: resolveHttpsOptions(),
     proxy: {
       '/api': process.env.VITE_DEV_API_TARGET || 'http://localhost:8787',

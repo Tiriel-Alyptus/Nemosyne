@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "npm run dev:full",
+    "dev": "node scripts/dev.js",
     "dev:client": "vite",
     "dev:server": "node server/index.js",
     "dev:full": "concurrently -k -n server,client -c red,blue \"node server/index.js\" \"vite\"",
