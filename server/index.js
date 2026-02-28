@@ -1,4 +1,4 @@
-import fs from 'fs'
+﻿import fs from 'fs'
 import dotenv from 'dotenv'
 import express from 'express'
 import path from 'path'
@@ -106,6 +106,7 @@ const smtpPort = Number(process.env.SMTP_PORT || 465)
 const smtpUser = process.env.SMTP_USER
 const smtpPass = process.env.SMTP_PASS
 const smtpFrom = process.env.SMTP_FROM || smtpUser
+const smtpEnabled = Boolean(smtpUser && smtpPass && smtpFrom)
 
 const mailer =
   smtpUser && smtpPass
@@ -119,6 +120,12 @@ const mailer =
         },
       })
     : null
+
+if (!smtpEnabled) {
+  console.warn(
+    '[email] SMTP non configure: definir SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS et SMTP_FROM.',
+  )
+}
 
 app.disable('x-powered-by')
 app.set('trust proxy', 1)
@@ -347,15 +354,38 @@ function buildVerifyLink(baseUrl, token) {
 }
 
 async function sendVerificationEmail(email, token, baseUrl) {
-  if (!mailer || !smtpFrom) return false
   const link = buildVerifyLink(baseUrl, token)
-  await mailer.sendMail({
-    from: smtpFrom,
-    to: email,
-    subject: 'Vérification de votre email',
-    text: `Cliquez sur ce lien pour vérifier votre email: ${link}`,
-  })
-  return true
+  if (!mailer || !smtpFrom) {
+    console.warn(`[email] Verification non envoyee (SMTP absent) pour ${email}`)
+    if (!isProd) {
+      console.info(`[email] Lien verification dev: ${link}`)
+    }
+    return {
+      sent: false,
+      reason: 'smtp-not-configured',
+      previewLink: !isProd ? link : null,
+    }
+  }
+  try {
+    await mailer.sendMail({
+      from: smtpFrom,
+      to: email,
+      subject: 'Verification de votre email Nemosyne',
+      text: `Cliquez sur ce lien pour verifier votre email: ${link}`,
+      html: `<p>Cliquez sur ce lien pour verifier votre email:</p><p><a href="${link}">${link}</a></p>`,
+    })
+    return { sent: true, reason: null, previewLink: null }
+  } catch (error) {
+    console.error('[email] Echec envoi verification', error)
+    if (!isProd) {
+      console.info(`[email] Lien verification dev: ${link}`)
+    }
+    return {
+      sent: false,
+      reason: 'smtp-send-failed',
+      previewLink: !isProd ? link : null,
+    }
+  }
 }
 
 function validatePayload(payload) {
@@ -543,11 +573,34 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   ) {
     return res.status(400).json({ error: 'weak-password' })
   }
-  const existing = await pool.query('SELECT id FROM users WHERE email = $1 LIMIT 1', [
+  const existing = await pool.query('SELECT * FROM users WHERE email = $1 LIMIT 1', [
     normalizedEmail,
   ])
-  if (existing.rowCount > 0) {
-    return res.status(409).json({ error: 'email-taken' })
+  const existingUser = mapUser(existing.rows[0])
+  if (existingUser) {
+    if (existingUser.verified) {
+      return res.status(409).json({ error: 'email-taken' })
+    }
+    const verifyToken = crypto.randomBytes(32).toString('hex')
+    const verifyTokenHash = hashToken(verifyToken)
+    await pool.query(
+      'UPDATE users SET verify_token_hash = $1, verify_token_expires_at = $2 WHERE id = $3',
+      [verifyTokenHash, Date.now() + verifyTokenTtlMs, existingUser.id],
+    )
+    const emailDelivery = await sendVerificationEmail(
+      normalizedEmail,
+      verifyToken,
+      getRequestBase(req),
+    )
+    return res.json({
+      ok: true,
+      email: normalizedEmail,
+      authenticated: false,
+      accountStatus: 'pending-verification',
+      verificationEmailSent: emailDelivery.sent,
+      verificationEmailReason: emailDelivery.reason,
+      verificationEmailPreviewLink: emailDelivery.previewLink,
+    })
   }
   const passwordHash = await hashPassword(password)
   const verifyToken = crypto.randomBytes(32).toString('hex')
@@ -573,8 +626,20 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     lastSeenTs: now,
   }
   setSessionCookie(res, req.session.id)
-  await sendVerificationEmail(normalizedEmail, verifyToken, getRequestBase(req))
-  return res.json({ ok: true, email: normalizedEmail })
+  const emailDelivery = await sendVerificationEmail(
+    normalizedEmail,
+    verifyToken,
+    getRequestBase(req),
+  )
+  return res.json({
+    ok: true,
+    email: normalizedEmail,
+    authenticated: true,
+    accountStatus: 'created',
+    verificationEmailSent: emailDelivery.sent,
+    verificationEmailReason: emailDelivery.reason,
+    verificationEmailPreviewLink: emailDelivery.previewLink,
+  })
 })
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -641,10 +706,20 @@ app.post('/api/auth/resend-verification', verifyLimiter, async (req, res) => {
   )
   const user = mapUser(userResult.rows[0])
   if (!user) {
-    return res.status(200).json({ ok: true })
+    return res.status(200).json({
+      ok: true,
+      verificationEmailSent: false,
+      verificationEmailReason: 'not-delivered',
+      verificationEmailPreviewLink: null,
+    })
   }
   if (user.verified) {
-    return res.status(200).json({ ok: true })
+    return res.status(200).json({
+      ok: true,
+      verificationEmailSent: false,
+      verificationEmailReason: 'not-delivered',
+      verificationEmailPreviewLink: null,
+    })
   }
   const verifyToken = crypto.randomBytes(32).toString('hex')
   const verifyTokenHash = hashToken(verifyToken)
@@ -652,8 +727,17 @@ app.post('/api/auth/resend-verification', verifyLimiter, async (req, res) => {
     'UPDATE users SET verify_token_hash = $1, verify_token_expires_at = $2 WHERE id = $3',
     [verifyTokenHash, Date.now() + verifyTokenTtlMs, user.id],
   )
-  await sendVerificationEmail(user.email, verifyToken, getRequestBase(req))
-  return res.json({ ok: true })
+  const emailDelivery = await sendVerificationEmail(
+    user.email,
+    verifyToken,
+    getRequestBase(req),
+  )
+  return res.json({
+    ok: true,
+    verificationEmailSent: emailDelivery.sent,
+    verificationEmailReason: emailDelivery.reason,
+    verificationEmailPreviewLink: emailDelivery.previewLink,
+  })
 })
 
 app.get('/api/auth/verify', async (req, res) => {

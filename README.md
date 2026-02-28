@@ -94,3 +94,24 @@ export default defineConfig([
   },
 ])
 ```
+
+## Verification Email (SMTP)
+
+Les emails de verification utilisent SMTP via `nodemailer`.  
+Si SMTP n'est pas configure, le backend cree le compte mais signale que l'email n'a pas ete envoye.
+
+Variables a definir:
+
+```bash
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USER=your-smtp-user
+SMTP_PASS=your-smtp-password
+SMTP_FROM="Nemosyne <no-reply@nemosyne.app>"
+```
+
+Notes:
+
+- `SMTP_PORT=465` implique TLS (`secure: true`).
+- `SMTP_PORT=587` fonctionne aussi (`secure: false`).
+- En dev, si l'envoi echoue, l'API retourne un `verificationEmailPreviewLink` pour tester le parcours.

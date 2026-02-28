@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+﻿import { useEffect, useMemo, useState } from 'react'
 import { Link, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import logo from './assets/logo.svg'
 
@@ -38,6 +38,12 @@ const presets = [
   { label: '24 heures', minutes: 60 * 24 },
   { label: '7 jours', minutes: 60 * 24 * 7 },
 ]
+const quickDurationPresets = [
+  { label: '1 h', minutes: 60 },
+  { label: '1 j', minutes: 60 * 24 },
+  { label: '7 j', minutes: 60 * 24 * 7 },
+]
+const quickViewPresets = [1, 5, 10]
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)
   ?.trim()
   .replace(/\/$/, '')
@@ -65,6 +71,21 @@ function formatTime(ts: number) {
     day: '2-digit',
     month: 'short',
   })
+}
+
+function formatDuration(minutes: number) {
+  if (minutes < 60) return `${minutes} min`
+  if (minutes % (60 * 24) === 0) {
+    const days = minutes / (60 * 24)
+    return days === 1 ? '1 jour' : `${days} jours`
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60
+    return hours === 1 ? '1 heure' : `${hours} heures`
+  }
+  const hours = Math.floor(minutes / 60)
+  const remainder = minutes % 60
+  return `${hours} h ${remainder} min`
 }
 
 function buildLink(id: string, key?: string) {
@@ -236,17 +257,29 @@ function Home() {
   const [authError, setAuthError] = useState('')
   const [authLoading, setAuthLoading] = useState(false)
   const [showAuth, setShowAuth] = useState(false)
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>(() => {
+    if (typeof window === 'undefined') return 'signup'
+    const stored = window.localStorage.getItem('auth-mode')
+    return stored === 'signin' || stored === 'signup' ? stored : 'signup'
+  })
+  const [fullName, setFullName] = useState('')
+  const [rememberMe, setRememberMe] = useState(() => {
+    if (typeof window === 'undefined') return true
+    const stored = window.localStorage.getItem('auth-remember')
+    return stored !== '0'
+  })
   const [mfaRequired, setMfaRequired] = useState(false)
   const [mfaSetup, setMfaSetup] = useState(false)
   const [mfaQr, setMfaQr] = useState<string | null>(null)
   const [secret, setSecret] = useState('')
-  const [mode, setMode] = useState<'text' | 'file'>('text')
+  const [mode, setMode] = useState<'text' | 'file' | 'url'>('text')
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState('')
   const [label] = useState('Accès base staging')
   const [views, setViews] = useState(3)
   const [expiry, setExpiry] = useState(presets[2].minutes)
   const [passphrase, setPassphrase] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [generatedPassword, setGeneratedPassword] = useState('')
   const [passwordLength, setPasswordLength] = useState(20)
   const [useUpper, setUseUpper] = useState(true)
@@ -276,6 +309,22 @@ function Home() {
     return date.getTime()
   }, [expiry])
   const expiresAtLabel = useMemo(() => formatTime(expiresAt), [expiresAt])
+  const durationLabel = useMemo(() => formatDuration(expiry), [expiry])
+  const viewsLabel = useMemo(() => (views > 1 ? `${views} vues` : '1 vue'), [views])
+  const isFileMode = mode === 'file'
+  const textareaPlaceholder = mode === 'url'
+    ? 'Entrez l’URL sensible a publier...'
+    : 'Entrez le mot de passe, le texte ou l’URL a publier...'
+  const statusLabel = status === 'working'
+    ? 'Chiffrement...'
+    : status === 'ready' || status === 'autocopied'
+      ? 'Lien pret'
+      : status === 'copied'
+        ? 'Copie'
+        : status === 'error'
+          ? 'A verifier'
+          : 'En attente'
+  const mainCtaLabel = status === 'working' ? 'Creation en cours...' : 'Creer le lien securise'
 
   const focusComposer = () => {
     const editor = document.getElementById('memo-area') as HTMLTextAreaElement | null
@@ -308,6 +357,19 @@ function Home() {
     window.localStorage.setItem('theme', theme)
   }, [theme])
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const rememberedEmail = window.localStorage.getItem('auth-email')
+    if (rememberedEmail) {
+      setEmail(rememberedEmail)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem('auth-mode', authMode)
+  }, [authMode])
+
   const refreshHistory = async () => {
     try {
       const session = await apiRequest<{
@@ -322,6 +384,17 @@ function Home() {
       setHistory(data.items.map(toSummary))
     } catch {
       setHistory([])
+    }
+  }
+
+  const persistRememberedAuth = (nextEmail: string) => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem('auth-mode', authMode)
+    window.localStorage.setItem('auth-remember', rememberMe ? '1' : '0')
+    if (rememberMe) {
+      window.localStorage.setItem('auth-email', nextEmail)
+    } else {
+      window.localStorage.removeItem('auth-email')
     }
   }
 
@@ -348,8 +421,11 @@ function Home() {
         },
       )
       setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
+      persistRememberedAuth(result.email)
       setPassword('')
       setOtp('')
+      setAuthError('')
+      setShowAuth(false)
       await refreshHistory()
     } catch (error) {
       if (error instanceof Error && error.message.includes('mfa-required')) {
@@ -383,15 +459,50 @@ function Home() {
       return
     }
     try {
-      const result = await apiRequest<{ ok: boolean; email: string }>(
+      const result = await apiRequest<{
+        ok: boolean
+        email: string
+        authenticated?: boolean
+        accountStatus?: 'created' | 'pending-verification'
+        verificationEmailSent?: boolean
+        verificationEmailReason?: string | null
+        verificationEmailPreviewLink?: string | null
+      }>(
         '/api/auth/register',
         {
           method: 'POST',
           body: JSON.stringify({ email, password }),
         },
       )
-      setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
+      const isAuthenticated = Boolean(result.authenticated)
+      if (isAuthenticated) {
+        setAuth({ authenticated: true, email: result.email, ownerType: 'user' })
+        persistRememberedAuth(result.email)
+      }
       setPassword('')
+      const devHint = result.verificationEmailPreviewLink
+        ? ` Lien dev: ${result.verificationEmailPreviewLink}`
+        : ''
+      if (result.accountStatus === 'pending-verification') {
+        if (result.verificationEmailSent) {
+          setAuthError('Compte déjà créé mais non vérifié. Nouvel email de vérification envoyé.')
+          showToast('Compte non vérifié: email de vérification renvoyé.', 'info')
+        } else {
+          setAuthError(
+            `Compte déjà créé mais non vérifié. Email non envoyé (raison: ${result.verificationEmailReason || 'inconnue'}).${devHint}`,
+          )
+          showToast('Compte non vérifié mais service email indisponible.', 'error')
+        }
+      } else if (result.verificationEmailSent) {
+        setAuthError('Compte créé. Email de vérification envoyé.')
+        showToast('Email de vérification envoyé.', 'success')
+        setShowAuth(false)
+      } else {
+        setAuthError(
+          `Compte créé, mais l'email de vérification n'a pas pu être envoyé (raison: ${result.verificationEmailReason || 'inconnue'}).${devHint}`,
+        )
+        showToast('Service email non disponible. Vérifiez la configuration SMTP.', 'error')
+      }
       await refreshHistory()
     } catch (error) {
       if (error instanceof Error && error.message.includes('api-409')) {
@@ -424,11 +535,37 @@ function Home() {
     setAuthLoading(true)
     setAuthError('')
     try {
-      await apiRequest('/api/auth/resend-verification', {
+      const targetEmail = (auth.email || email).trim()
+      if (!targetEmail) {
+        setAuthError('Email manquant pour le renvoi.')
+        setAuthLoading(false)
+        return
+      }
+      const result = await apiRequest<{
+        ok: boolean
+        verificationEmailSent?: boolean
+        verificationEmailReason?: string | null
+        verificationEmailPreviewLink?: string | null
+      }>('/api/auth/resend-verification', {
         method: 'POST',
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email: targetEmail }),
       })
-      setAuthError('Email de vérification envoyé.')
+      if (result.verificationEmailSent) {
+        setAuthError('Email de vérification envoyé.')
+        showToast('Email de vérification envoyé.', 'success')
+      } else {
+        const reason = result.verificationEmailReason || 'inconnue'
+        const devHint = result.verificationEmailPreviewLink
+          ? ` Lien dev: ${result.verificationEmailPreviewLink}`
+          : ''
+        if (reason === 'not-delivered') {
+          setAuthError('Si un compte non vérifié existe pour cet email, un nouveau lien a été envoyé.')
+          showToast('Demande prise en compte.', 'info')
+        } else {
+          setAuthError(`Email non envoyé (raison: ${reason}).${devHint}`)
+          showToast('Email non envoyé. Vérifiez la configuration SMTP.', 'error')
+        }
+      }
     } catch {
       setAuthError('Impossible d’envoyer la vérification.')
     } finally {
@@ -479,7 +616,7 @@ function Home() {
       showToast('Le chiffrement nécessite HTTPS ou localhost.', 'error')
       return
     }
-    if (mode === 'text' && !secret.trim()) {
+    if (mode !== 'file' && !secret.trim()) {
       setStatus('error')
       showToast('Message requis.', 'error')
       return
@@ -569,6 +706,23 @@ function Home() {
     }
   }
 
+  const handleShareLink = async () => {
+    if (!link) return
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        await navigator.share({
+          title: 'Lien Nemosyne',
+          text: 'Lien securise Nemosyne',
+          url: link,
+        })
+        return
+      } catch {
+        // fallback below
+      }
+    }
+    await handleCopy()
+  }
+
   const generatePassword = (customLength?: number) => {
     const lower = 'abcdefghijklmnopqrstuvwxyz'
     const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -606,298 +760,383 @@ function Home() {
   }, [passwordLength, useUpper, useLower, useNumbers, useSymbols])
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 pb-14">
-      <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex items-center gap-3">
-          <img src={logo} alt="Nemosyne logo" className="h-10 w-10" />
-          <div className="flex flex-col leading-tight">
-            <span className="text-3xl font-semibold tracking-tight">Nemosyne</span>
-            <span className="text-[11px] uppercase tracking-[0.28em] text-[var(--ink-soft)]">
-              Mémos chiffrés
-            </span>
+    <div className="flex w-full flex-col gap-10 pb-28 lg:pb-14">
+      <header className="overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow)] backdrop-blur">
+        <div className="flex flex-col gap-4 px-5 py-4 lg:flex-row lg:items-center lg:justify-between lg:px-6">
+          <div className="flex items-center gap-3">
+            <img src={logo} alt="Nemosyne logo" className="h-10 w-10" />
+            <div className="flex flex-col leading-tight">
+              <span className="text-2xl font-semibold tracking-tight">Nemosyne</span>
+              <span className="text-[11px] uppercase tracking-[0.28em] text-[var(--ink-soft)]">
+                Liens sensibles et auto-destructibles
+              </span>
+            </div>
           </div>
-        </div>
 
-        <div className="flex flex-wrap items-center gap-3 lg:gap-4">
-          <div className="flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] p-1">
+          <nav className="hidden items-center gap-1 lg:flex">
+            <a
+              href="#history"
+              className="rounded-full px-3 py-2 text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)] hover:text-[var(--ink)]"
+            >
+              Publications
+            </a>
+            <a
+              href="#composer"
+              className="rounded-full px-3 py-2 text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)] hover:text-[var(--ink)]"
+            >
+              Demandes
+            </a>
+            <Link
+              to="/features"
+              className="rounded-full px-3 py-2 text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)] hover:text-[var(--ink)]"
+            >
+              Caracteristiques
+            </Link>
+            <Link
+              to="/whats-new"
+              className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)] hover:text-[var(--ink)]"
+            >
+              Quoi de neuf
+              <span className="h-2 w-2 rounded-full bg-red-500" />
+            </Link>
+          </nav>
+
+          <div className="flex flex-wrap items-center gap-2 lg:gap-3">
+            <div className="flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] p-1">
+              <button
+                type="button"
+                onClick={() => setTheme('dark')}
+                className={`h-6 w-6 rounded-full border ${
+                  theme === 'dark'
+                    ?'border-[var(--primary)] bg-[var(--primary)]'
+                    : 'border-[var(--line)] bg-[var(--surface)]'
+                }`}
+                aria-label="Mode sombre"
+              />
+              <button
+                type="button"
+                onClick={() => setTheme('light')}
+                className={`h-6 w-6 rounded-full border ${
+                  theme === 'light'
+                    ?'border-[var(--primary)] bg-[var(--primary)]'
+                    : 'border-[var(--line)] bg-[var(--surface)]'
+                }`}
+                aria-label="Mode clair"
+              />
+            </div>
             <button
               type="button"
-              onClick={() => setTheme('dark')}
-              className={`h-6 w-6 rounded-full border ${
-                theme === 'dark'
-                  ?'border-[var(--primary)] bg-[var(--primary)]'
-                  : 'border-[var(--line)] bg-[var(--surface)]'
-              }`}
-              aria-label="Mode sombre"
-            />
+              onClick={() => {
+                setAuthMode('signin')
+                setAuthError('')
+                setMfaRequired(false)
+                setOtp('')
+                setShowAuth(true)
+              }}
+              className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
+            >
+              Se connecter
+            </button>
             <button
               type="button"
-              onClick={() => setTheme('light')}
-              className={`h-6 w-6 rounded-full border ${
-                theme === 'light'
-                  ?'border-[var(--primary)] bg-[var(--primary)]'
-                  : 'border-[var(--line)] bg-[var(--surface)]'
-              }`}
-              aria-label="Mode clair"
-            />
+              onClick={() => {
+                setAuthMode('signup')
+                setAuthError('')
+                setMfaRequired(false)
+                setOtp('')
+                setShowAuth(true)
+              }}
+              className="pill border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white transition hover:opacity-90"
+            >
+              S'inscrire
+            </button>
           </div>
-          <div className="flex items-center gap-2 rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
-            <span>FR</span>
-            <span className="h-5 w-px bg-[var(--line)]" />
-            <span>EN</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setShowAuth(true)}
-            className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
-          >
-            Espace compte
-          </button>
         </div>
       </header>
 
 
       {showAuth ?(
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
-          <div className="card-elev w-full max-w-md rounded-2xl border border-[var(--line)]">
-            <div className="flex items-center justify-between border-b border-[var(--line)] px-5 py-3">
-              <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Accès à la gestion de mot de passe
-              </p>
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-[var(--bg-2)]/95 text-[var(--ink)] backdrop-blur-sm">
+          <div className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-5 py-8 md:px-10">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <img src={logo} alt="Nemosyne logo" className="h-9 w-9" />
+                <div className="leading-tight">
+                  <p className="text-xl font-semibold tracking-tight">Nemosyne</p>
+                  <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--ink-soft)]">
+                    Secure sharing
+                  </p>
+                </div>
+              </div>
               <button
                 type="button"
                 onClick={() => setShowAuth(false)}
-                className="text-sm text-[var(--ink-soft)]"
+                className="rounded-full border border-[var(--line)] px-4 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)] transition hover:bg-[var(--surface-muted)]"
                 aria-label="Fermer"
               >
-                ✕
+                Fermer
               </button>
             </div>
-            <div className="flex flex-col gap-3 px-5 py-4">
-              {auth.authenticated ?(
-                <div className="flex flex-col gap-2">
-                  <p className="text-sm text-[var(--ink)]">
-                    Connecté: <span className="font-semibold">{auth.email}</span>
-                  </p>
-                  {!auth.verified ?(
-                    <div className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-2 text-xs text-[var(--ink-soft)]">
-                      Email non vérifié. Vérifiez votre boîte mail.
+
+            <div className="mx-auto mt-8 w-full max-w-xl">
+              <div className="rounded-xl border border-[var(--line)] bg-[var(--surface)] px-6 py-7 shadow-[var(--shadow)] md:px-10 md:py-10">
+                {auth.authenticated ?(
+                  <div className="flex flex-col gap-4">
+                    <div className="text-center">
+                      <h2 className="text-4xl font-medium">Mon compte</h2>
+                      <p className="mt-2 text-sm text-[var(--ink-soft)]">
+                        Connecté avec <span className="font-semibold text-[var(--ink)]">{auth.email}</span>
+                      </p>
                     </div>
-                  ) : null}
-                  {auth.verified && !auth.mfaEnabled ?(
-                    <button
-                      type="button"
-                      onClick={handleMfaSetup}
-                      disabled={authLoading}
-                      className="w-fit rounded-md border border-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
-                    >
-                      Activer le MFA
-                    </button>
-                  ) : null}
-                  {mfaSetup && mfaQr ?(
-                    <div className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-3 text-xs text-[var(--ink-soft)]">
-                      <p className="mb-2">Scannez le QR code avec Google Authenticator.</p>
-                      <img src={mfaQr} alt="QR MFA" className="h-40 w-40" />
-                      <input
-                        value={otp}
-                        onChange={(event) => setOtp(event.target.value)}
-                        placeholder="Code MFA"
-                        className="mt-3 w-full rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                      />
+
+                    {!auth.verified ?(
+                      <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm text-[var(--ink)]">
+                        Email non vérifié. Vérifiez votre boîte de réception.
+                        <button
+                          type="button"
+                          onClick={handleResendVerification}
+                          disabled={authLoading}
+                          className="mt-3 block text-sm font-semibold text-[var(--primary)] underline disabled:opacity-50"
+                        >
+                          Renvoyer l’email de vérification
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {auth.verified && !auth.mfaEnabled ?(
                       <button
                         type="button"
-                        onClick={handleMfaEnable}
+                        onClick={handleMfaSetup}
                         disabled={authLoading}
-                        className="mt-2 w-fit rounded-md border border-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
+                        className="w-full rounded-md border border-[var(--primary)] px-4 py-3 text-sm font-semibold text-[var(--primary)]"
                       >
-                        Confirmer le MFA
+                        Activer le MFA
                       </button>
-                    </div>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={handleLogout}
-                    disabled={authLoading}
-                    className="w-fit rounded-md border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                  >
-                    Se déconnecter
-                  </button>
-                </div>
-              ) : (
-                <>
-                  <p className="text-[11px] text-[var(--ink-soft)]">
-                    Mode invité (historique uniquement sur cet appareil).
-                  </p>
-                  <input
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    placeholder="Email"
-                    className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                  />
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    placeholder="Mot de passe"
-                    className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                  />
-                  {mfaRequired ?(
-                    <input
-                      value={otp}
-                      onChange={(event) => setOtp(event.target.value)}
-                      placeholder="Code MFA (6 chiffres)"
-                      className="rounded-md border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)]"
-                    />
-                  ) : null}
-                  <div className="flex gap-2">
+                    ) : null}
+
+                    {mfaSetup && mfaQr ?(
+                      <div className="rounded-lg border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-4 text-sm text-[var(--ink-soft)]">
+                        <p className="mb-3">Scannez le QR code avec votre application TOTP.</p>
+                        <img src={mfaQr} alt="QR MFA" className="mx-auto h-40 w-40" />
+                        <input
+                          value={otp}
+                          onChange={(event) => setOtp(event.target.value)}
+                          placeholder="Code MFA"
+                          className="mt-3 w-full border-0 border-b border-[var(--line)] bg-transparent px-0 py-2 text-base text-[var(--ink)] focus:border-[var(--primary)]"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleMfaEnable}
+                          disabled={authLoading}
+                          className="mt-4 w-full rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-90"
+                        >
+                          Confirmer le MFA
+                        </button>
+                      </div>
+                    ) : null}
+
                     <button
                       type="button"
-                      onClick={handleLogin}
+                      onClick={handleLogout}
                       disabled={authLoading}
-                      className="rounded-md border border-[var(--primary)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--primary)]"
+                      className="w-full rounded-md border border-[var(--line)] px-4 py-3 text-sm font-semibold text-[var(--ink-soft)]"
                     >
-                      Se connecter
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleRegister}
-                      disabled={authLoading}
-                      className="rounded-md border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                    >
-                      Créer un compte
+                      Se déconnecter
                     </button>
                   </div>
-                  {authError ?(
-                    <p className="text-xs text-[var(--primary)]">{authError}</p>
-                  ) : null}
+                ) : (
+                  <>
+                    <div className="text-center">
+                      <h2 className="text-5xl font-light tracking-tight">
+                        {authMode === 'signup' ? 'Sign up' : 'Sign in'}
+                      </h2>
+                      <p className="mt-2 text-xl text-[var(--ink-soft)]">
+                        {authMode === 'signup'
+                          ? 'Créer votre espace sécurisé'
+                          : 'Connectez-vous pour continuer'}
+                      </p>
+                    </div>
+
+                    <div className="mt-8 flex flex-col gap-7">
+                      {authMode === 'signup' ?(
+                        <div className="flex flex-col gap-2">
+                          <label className="text-[15px] text-[var(--ink-soft)]">Name</label>
+                          <input
+                            value={fullName}
+                            onChange={(event) => setFullName(event.target.value)}
+                            placeholder="Votre nom"
+                            className="border-0 border-b border-[var(--line)] bg-transparent px-0 pb-2 pt-1 text-lg text-[var(--ink)] focus:border-[var(--primary)]"
+                          />
+                        </div>
+                      ) : null}
+
+                      <div className="flex flex-col gap-2">
+                        <label className="text-[15px] text-[var(--ink-soft)]">Email</label>
+                        <input
+                          value={email}
+                          onChange={(event) => setEmail(event.target.value)}
+                          placeholder="votre@email.com"
+                          className="border-0 border-b border-[var(--line)] bg-transparent px-0 pb-2 pt-1 text-lg text-[var(--ink)] focus:border-[var(--primary)]"
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-2">
+                        <label className="text-[15px] text-[var(--ink-soft)]">Password</label>
+                        <input
+                          type="password"
+                          value={password}
+                          onChange={(event) => setPassword(event.target.value)}
+                          placeholder="Mot de passe"
+                          className="border-0 border-b border-[var(--line)] bg-transparent px-0 pb-2 pt-1 text-lg text-[var(--ink)] focus:border-[var(--primary)]"
+                        />
+                      </div>
+
+                      {authMode === 'signin' && mfaRequired ?(
+                        <div className="flex flex-col gap-2">
+                          <label className="text-[15px] text-[var(--ink-soft)]">Code MFA</label>
+                          <input
+                            value={otp}
+                            onChange={(event) => setOtp(event.target.value)}
+                            placeholder="6 chiffres"
+                            className="border-0 border-b border-[var(--line)] bg-transparent px-0 pb-2 pt-1 text-lg text-[var(--ink)] focus:border-[var(--primary)]"
+                          />
+                        </div>
+                      ) : null}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (authMode === 'signup') {
+                            handleRegister()
+                            return
+                          }
+                          handleLogin()
+                        }}
+                        disabled={authLoading}
+                        className="mt-2 w-full rounded-md border border-[var(--primary)] bg-[var(--primary)] px-4 py-3 text-xl font-semibold text-white shadow-[var(--shadow)] transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {authLoading
+                          ? 'Chargement...'
+                          : authMode === 'signup'
+                            ? 'Sign up'
+                            : 'Sign in'}
+                      </button>
+
+                      <label className="flex items-center gap-3 text-lg text-[var(--ink)]">
+                        <input
+                          type="checkbox"
+                          checked={rememberMe}
+                          onChange={(event) => setRememberMe(event.target.checked)}
+                          className="h-4 w-4 rounded border-[var(--line)] accent-[var(--primary)]"
+                        />
+                        Remember me
+                      </label>
+
+                      {authError ?(
+                        <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                          {authError}
+                        </p>
+                      ) : null}
+
+                      {authMode === 'signup' ?(
+                        <button
+                          type="button"
+                          onClick={handleResendVerification}
+                          disabled={authLoading}
+                          className="w-fit text-sm text-[var(--primary)] underline"
+                        >
+                          Renvoyer l’email de vérification
+                        </button>
+                      ) : null}
+
+                      <div className="mt-1 flex items-center gap-4">
+                        <span className="h-px flex-1 bg-[var(--line)]" />
+                        <span className="text-sm font-semibold uppercase tracking-[0.1em] text-[var(--ink-soft)]">
+                          Access quickly
+                        </span>
+                        <span className="h-px flex-1 bg-[var(--line)]" />
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-3">
+                        <button
+                          type="button"
+                          onClick={() => showToast('Connexion Google bientôt disponible.')}
+                          className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-2 text-sm font-semibold text-[var(--primary)] transition hover:border-[var(--primary)]"
+                        >
+                          Google
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => showToast('Connexion LinkedIn bientôt disponible.')}
+                          className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-2 text-sm font-semibold text-[var(--primary)] transition hover:border-[var(--primary)]"
+                        >
+                          Linkedin
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => showToast('SSO bientôt disponible.')}
+                          className="rounded-md border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-2 text-sm font-semibold text-[var(--primary)] transition hover:border-[var(--primary)]"
+                        >
+                          SSO
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {!auth.authenticated ?(
+                <p className="mt-6 text-center text-lg text-[var(--ink-soft)]">
+                  {authMode === 'signup'
+                    ? 'Already have an account? '
+                    : 'Need an account? '}
                   <button
                     type="button"
-                    onClick={handleResendVerification}
-                    disabled={authLoading}
-                    className="w-fit text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                    onClick={() => {
+                      const nextMode = authMode === 'signup' ? 'signin' : 'signup'
+                      setAuthMode(nextMode)
+                      setAuthError('')
+                      setMfaRequired(false)
+                      setOtp('')
+                    }}
+                    className="font-semibold text-[var(--primary)] underline"
                   >
-                    Renvoyer l’email de vérification
+                    {authMode === 'signup' ? 'Sign in' : 'Sign up'}
                   </button>
-                </>
-              )}
+                </p>
+              ) : null}
             </div>
           </div>
         </div>
       ) : null}
 
       
-      <section className="grid gap-6 xl:grid-cols-[1.05fr_1fr]">
-        <div className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface-elev)]/90 p-8 shadow-[var(--shadow)] backdrop-blur">
-          <div className="absolute inset-0 bg-gradient-to-br from-[var(--primary-weak)] via-[var(--surface-muted)] to-transparent" />
-          <div className="absolute -left-24 -top-24 h-56 w-56 rounded-full bg-[var(--primary-weak)] blur-3xl" />
-          <div className="absolute -right-16 bottom-0 h-48 w-48 rounded-full bg-[var(--accent)]/20 blur-3xl" />
-          <div className="relative z-10 flex flex-col gap-6">
-            <div className="flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
-                Chiffrement local
-              </span>
-              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
-                Lien unique
-              </span>
-              <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1">
-                Auto-suppression
-              </span>
-            </div>
-            <div className="flex flex-col gap-3">
-              <h1 className="text-4xl font-semibold leading-[1.05] md:text-5xl">
-                Mémo chiffré, prêt en 10 secondes.
-              </h1>
-              <p className="max-w-xl text-sm text-[var(--ink-soft)]">
-                Écris ou importe, fixe l'expiration et partage le lien. Zéro texte inutile.
-              </p>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Mode</p>
-                <p className="text-lg font-semibold text-[var(--ink)]">
-                  {mode === 'text' ? 'Texte' : 'Fichier'}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Expiration</p>
-                <p className="text-lg font-semibold text-[var(--ink)]">{expiresAtLabel}</p>
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface)]/80 px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Vues</p>
-                <p className="text-lg font-semibold text-[var(--ink)]">{views} max</p>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
-              {['Écrire ou importer', 'Limiter + protéger', 'Partager le lien'].map((step) => (
-                <span
-                  key={step}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1"
-                >
-                  {step}
-                </span>
-              ))}
-            </div>
-            <div className="flex flex-wrap gap-3">
-              <button
-                type="button"
-                onClick={focusComposer}
-                className="pill border border-[var(--primary)] bg-[var(--primary)] px-5 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-              >
-                Commencer un mémo
-              </button>
-              {link ? (
-                <button
-                  type="button"
-                  onClick={handleCopy}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
-                >
-                  Copier le lien actuel
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!generatedPassword) generatePassword()
-                    handleCopyGenerated()
-                  }}
-                  className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-2 text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]"
-                >
-                  Générer un mot de passe
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <section id="composer" className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow-strong)] backdrop-blur">
-          <div className="flex items-center justify-between border-b border-[var(--line)] px-6 py-4">
-            <div>
-              <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
-                Composer
-              </p>
-              <p className="text-base font-semibold text-[var(--ink)]">Mémo sécurisé</p>
-            </div>
-            <span className="pill border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-xs text-[var(--ink-soft)]">
-              {status === 'working'
-                ? 'Chiffrement…'
-                : status === 'ready' || status === 'autocopied'
-                  ? 'Lien prêt'
-                  : status === 'copied'
-                    ? 'Copié'
-                    : status === 'error'
-                      ? 'À vérifier'
-                      : 'En attente'}
-            </span>
+      <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start">
+        <section
+          id="composer"
+          className="relative overflow-hidden rounded-3xl border border-[var(--line)] bg-[var(--surface)]/95 shadow-[var(--shadow-strong)] backdrop-blur"
+        >
+          <div className="flex flex-col gap-2 border-b border-[var(--line)] px-5 py-5 md:px-6">
+            <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+              Nouveau lien
+            </p>
+            <h1 className="text-3xl font-semibold leading-tight md:text-4xl">
+              Publier un secret en moins de 10 secondes
+            </h1>
+            <p className="max-w-2xl text-sm text-[var(--ink-soft)]">
+              Collez votre secret, reglez l'expiration, puis creez le lien securise.
+            </p>
           </div>
 
-          <div className="flex flex-col gap-5 p-6">
-            <div className="flex flex-wrap gap-3">
+          <div className="flex flex-col gap-6 p-5 md:p-6">
+            <div className="grid gap-2 sm:grid-cols-3">
               <button
                 type="button"
                 onClick={() => {
                   setMode('text')
                   setFile(null)
                   setFileError('')
+                  focusComposer()
                 }}
                 className={`rounded-xl border px-4 py-3 text-sm font-semibold transition ${
                   mode === 'text'
@@ -905,86 +1144,122 @@ function Home() {
                     : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
                 }`}
               >
-                Écrire un message
+                Mots de passe et texte
               </button>
-              <label
-                className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-3 text-center text-xs transition ${
+              <button
+                type="button"
+                onClick={() => setMode('file')}
+                className={`rounded-xl border px-4 py-3 text-sm font-semibold transition ${
                   mode === 'file'
-                    ?'border-[var(--primary)] bg-[var(--primary-weak)] text-[var(--primary)]'
+                    ?'border-[var(--primary)] bg-[var(--primary)] text-white'
                     : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
                 }`}
               >
-                <input
-                  type="file"
-                  className="hidden"
-                  onChange={(event) => {
-                    const selected = event.target.files?.[0]
-                    if (!selected) return
-                    const maxBytes = 5 * 1024 * 1024
-                    if (selected.size > maxBytes) {
-                      setFile(null)
-                      setFileError('Fichier trop volumineux (max 5 MB).')
-                      setMode('file')
-                      return
-                    }
-                    setFile(selected)
-                    setFileError('')
-                    setMode('file')
-                  }}
-                />
-                {file ?(
-                  <>
-                    <span className="font-semibold text-[var(--primary)]">
-                      {file.name}
-                    </span>
-                    <span className="mt-1 text-[10px] text-[var(--ink-soft)]">
-                      {formatBytes(file.size)}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    Importer un fichier
-                    <span className="mt-1 text-[10px] text-[var(--ink-soft)]">
-                      Taille max : 5 MB
-                    </span>
-                  </>
-                )}
-              </label>
-            </div>
-
-            <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-4 py-3">
-              <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                Message
-              </label>
-              <textarea
-                id="memo-area"
-                rows={4}
-                value={secret}
-                disabled={mode === 'file'}
-                onChange={(event) => {
-                  setSecret(event.target.value)
-                  setStatus('idle')
+                Fichiers
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMode('url')
+                  setFile(null)
+                  setFileError('')
+                  focusComposer()
                 }}
-                placeholder="Tape ton secret ou colle-le ici."
-                className="w-full resize-none rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-60"
-              />
-              {fileError ?(
-                <p className="text-xs text-[var(--primary)]">{fileError}</p>
-              ) : null}
+                className={`rounded-xl border px-4 py-3 text-sm font-semibold transition ${
+                  mode === 'url'
+                    ?'border-[var(--primary)] bg-[var(--primary)] text-white'
+                    : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
+                }`}
+              >
+                URLs
+              </button>
             </div>
 
-            <div className="grid gap-4 lg:grid-cols-3">
-              <div className="flex flex-col gap-3 lg:col-span-2">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Expiration
-                </p>
+            {isFileMode ? (
+              <div className="flex flex-col gap-3 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-4 py-4">
+                <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  Fichier
+                </label>
+                <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[var(--line)] bg-[var(--surface)] px-5 py-6 text-center text-sm text-[var(--ink-soft)] transition hover:border-[var(--primary)]">
+                  <input
+                    type="file"
+                    className="hidden"
+                    onChange={(event) => {
+                      const selected = event.target.files?.[0]
+                      if (!selected) return
+                      const maxBytes = 5 * 1024 * 1024
+                      if (selected.size > maxBytes) {
+                        setFile(null)
+                        setFileError('Fichier trop volumineux (max 5 MB).')
+                        return
+                      }
+                      setFile(selected)
+                      setFileError('')
+                    }}
+                  />
+                  {file ? (
+                    <>
+                      <span className="text-base font-semibold text-[var(--ink)]">{file.name}</span>
+                      <span className="mt-1 text-xs">{formatBytes(file.size)}</span>
+                      <span className="mt-2 rounded-full border border-[var(--line)] px-3 py-1 text-[11px] uppercase tracking-[0.2em]">
+                        Remplacer le fichier
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      Deposer ou choisir un fichier
+                      <span className="mt-2 text-xs">Taille maximum: 5 MB</span>
+                    </>
+                  )}
+                </label>
+                {fileError ? <p className="text-xs text-[var(--primary)]">{fileError}</p> : null}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3 rounded-2xl border border-[var(--line)] bg-[var(--field-muted)] px-4 py-4">
+                <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                  {mode === 'url' ? 'URL sensible' : 'Secret / texte'}
+                </label>
+                <textarea
+                  id="memo-area"
+                  rows={10}
+                  value={secret}
+                  onChange={(event) => {
+                    setSecret(event.target.value)
+                    setStatus('idle')
+                  }}
+                  placeholder={textareaPlaceholder}
+                  className="w-full resize-y rounded-xl border border-[var(--line)] bg-[var(--field)] px-4 py-4 text-sm text-[var(--ink)]"
+                />
+              </div>
+            )}
+
+            <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3">
+              <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Astuce</p>
+              <p className="mt-1 text-sm text-[var(--ink-soft)]">
+                Ne mettez ici que le secret, gardez le contexte dans un autre canal.
+              </p>
+            </div>
+
+          </div>
+        </section>
+
+        <aside className="flex flex-col gap-4">
+          <div className="card rounded-2xl px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Parametres du lien</p>
+            <h2 className="mt-1 text-sm font-semibold text-[var(--ink)]">
+              Expiration et acces
+            </h2>
+
+            <div className="mt-4 flex flex-col gap-4">
+              <div className="flex flex-col gap-3">
+                <label className="text-sm font-semibold text-[var(--ink)]">Expiration (duree)</label>
                 <div className="flex flex-wrap gap-2">
-                  {presets.map((preset) => (
+                  {quickDurationPresets.map((preset) => (
                     <button
                       key={preset.label}
                       type="button"
                       onClick={() => setExpiry(preset.minutes)}
-                      className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.2em] transition ${
+                      className={`rounded-full border px-3 py-1.5 text-xs uppercase tracking-[0.2em] transition ${
                         expiry === preset.minutes
                           ?'border-[var(--primary)] bg-[var(--primary)] text-white'
                           : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
@@ -994,91 +1269,169 @@ function Home() {
                     </button>
                   ))}
                 </div>
-              </div>
-              <div className="flex flex-col gap-3">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Vues max
-                </p>
-                <input
-                  type="number"
-                  min={1}
-                  max={20}
-                  value={views}
-                  onChange={(event) => setViews(Number(event.target.value))}
-                  className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
-                />
-              </div>
-            </div>
-
-            <div className="grid gap-3 lg:grid-cols-2">
-              <div className="flex flex-col gap-2">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Passphrase (option)
-                </p>
-                <input
-                  value={passphrase}
-                  onChange={(event) => setPassphrase(event.target.value)}
-                  className="rounded-lg border border-[var(--line)] bg-[var(--field)] px-4 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--primary)]"
-                  placeholder="Ajoute une passphrase"
-                  type="password"
-                />
-              </div>
-              <div className="flex flex-col gap-2 rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm text-[var(--ink-soft)]">
-                <p className="text-[11px] uppercase tracking-[0.2em]">Accès</p>
-                <p className="leading-relaxed">
-                  Lien + clé dans l'URL. Ajoute une passphrase pour une double barrière.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={handleGenerate}
-                  className="rounded-md bg-[var(--primary)] px-6 py-2 text-sm font-semibold text-white transition hover:opacity-90"
-                >
-                  {status === 'working' ?'Chiffrement…' : 'Générer le lien'}
-                </button>
-                {status === 'error' ?(
-                  <p className="text-sm text-[var(--primary)]">
-                    Vérifie les champs ou réessaie.
-                  </p>
-                ) : null}
-              </div>
-              <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-muted)] px-4 py-3 text-sm">
-                {link ? (
-                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                    <span className="break-all text-[var(--ink)]">{link}</span>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={handleCopy}
-                        className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
-                      >
-                        Copier
-                      </button>
-                      <span className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                        {status === 'copied'
-                          ? 'Copié'
-                          : status === 'autocopied'
-                            ? 'Auto-copié'
-                            : 'Prêt'}
-                      </span>
-                    </div>
-                  </div>
-                ) : (
-                  <span className="text-[var(--ink-soft)]">
-                    Le lien apparaît ici après génération.
+                <div className="flex items-center gap-3">
+                  <input
+                    type="range"
+                    min={15}
+                    max={10080}
+                    step={15}
+                    value={expiry}
+                    onChange={(event) => setExpiry(Number(event.target.value))}
+                    className="w-full accent-[var(--primary)]"
+                  />
+                  <span className="min-w-[72px] text-right text-sm font-semibold text-[var(--ink)]">
+                    {durationLabel}
                   </span>
-                )}
+                </div>
               </div>
+
+              <div className="flex flex-col gap-3">
+                <label className="text-sm font-semibold text-[var(--ink)]">Expiration (vues)</label>
+                <div className="flex flex-wrap gap-2">
+                  {quickViewPresets.map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => setViews(preset)}
+                      className={`rounded-full border px-3 py-1.5 text-xs uppercase tracking-[0.2em] transition ${
+                        views === preset
+                          ?'border-[var(--primary)] bg-[var(--primary)] text-white'
+                          : 'border-[var(--line)] bg-[var(--surface-muted)] text-[var(--ink-soft)] hover:border-[var(--primary)]'
+                      }`}
+                    >
+                      {preset} {preset > 1 ? 'vues' : 'vue'}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="range"
+                    min={1}
+                    max={20}
+                    step={1}
+                    value={views}
+                    onChange={(event) => setViews(Number(event.target.value))}
+                    className="w-full accent-[var(--primary)]"
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={views}
+                    onChange={(event) => {
+                      const next = Number(event.target.value)
+                      if (!Number.isFinite(next)) return
+                      setViews(Math.max(1, Math.min(20, Math.round(next))))
+                    }}
+                    className="w-16 rounded-lg border border-[var(--line)] bg-[var(--field)] px-2 py-1.5 text-sm text-[var(--ink)]"
+                  />
+                </div>
+              </div>
+
+              <p className="text-xs text-[var(--ink-soft)]">
+                (La premiere condition atteinte supprime le memo)
+              </p>
             </div>
           </div>
-        </section>
+
+          <div className="card rounded-2xl px-4 py-4">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((current) => !current)}
+              className="flex w-full items-center justify-between text-left"
+            >
+              <span className="text-sm font-semibold text-[var(--ink)]">Options supplementaires</span>
+              <span className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                {showAdvanced ? 'Masquer' : 'Afficher'}
+              </span>
+            </button>
+            {showAdvanced ? (
+              <div className="mt-3 border-t border-[var(--line)] pt-3">
+                <div className="flex flex-col gap-2">
+                  <label className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                    Securite (optionnel)
+                  </label>
+                  <input
+                    value={passphrase}
+                    onChange={(event) => setPassphrase(event.target.value)}
+                    className="rounded-xl border border-[var(--line)] bg-[var(--field)] px-4 py-3 text-sm text-[var(--ink)]"
+                    placeholder="Exiger une passphrase pour ouvrir"
+                    type="password"
+                  />
+                  <p className="text-xs text-[var(--ink-soft)]">
+                    Cette passphrase sera demandee au destinataire avant le dechiffrement.
+                  </p>
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="card-elev rounded-2xl px-4 py-4 lg:sticky lg:top-6">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Publication</p>
+              <span className="rounded-full border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+                {statusLabel}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handleGenerate}
+              className="hidden w-full rounded-xl border border-[var(--primary)] bg-[var(--primary)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-90 lg:block"
+            >
+              {mainCtaLabel}
+            </button>
+            {status === 'error' ? (
+              <p className="mt-2 text-xs text-[var(--primary)]">Verifiez les champs puis reessayez.</p>
+            ) : null}
+
+            <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--surface-muted)] px-3 py-3">
+              <p className="text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">Resultat</p>
+              {link ? (
+                <div className="mt-2 flex flex-col gap-3">
+                  <span className="break-all text-sm text-[var(--ink)]">{link}</span>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={handleCopy}
+                      className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                    >
+                      Copier
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleShareLink}
+                      className="rounded-full border border-[var(--line)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]"
+                    >
+                      Partager
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                  Le lien apparaîtra ici apres generation.
+                </p>
+              )}
+            </div>
+
+            <p className="mt-3 text-xs text-[var(--ink-soft)]">
+              Expire le {expiresAtLabel}. Maximum {viewsLabel}.
+            </p>
+          </div>
+        </aside>
       </section>
 
-      <section className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
+      <div className="fixed inset-x-0 bottom-0 z-40 border-t border-[var(--line)] bg-[var(--surface)]/95 px-4 py-3 backdrop-blur lg:hidden">
+        <div className="mx-auto w-full max-w-6xl">
+          <button
+            type="button"
+            onClick={handleGenerate}
+            className="w-full rounded-xl border border-[var(--primary)] bg-[var(--primary)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-90"
+          >
+            {mainCtaLabel}
+          </button>
+        </div>
+      </div>
+      <section id="history" className="grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
         <div className="card rounded-2xl px-5 py-5">
           <div className="flex items-center justify-between">
             <div>
@@ -1218,7 +1571,7 @@ function Home() {
 
 
       {toast ? (
-        <div className="fixed bottom-6 right-6 z-50">
+        <div className="fixed bottom-24 right-4 z-50 sm:right-6 lg:bottom-6">
           <div
             className={`rounded-full border px-4 py-2 text-xs uppercase tracking-[0.2em] shadow-lg ${
               toast.kind === 'success'
@@ -1588,107 +1941,275 @@ function VerifyEmail() {
 
 function LegalPage({
   title,
+  subtitle,
+  updatedAt,
   children,
 }: {
   title: string
+  subtitle?: string
+  updatedAt?: string
   children: React.ReactNode
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
-      <h1 className="text-3xl font-semibold">{title}</h1>
-      <div className="rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-6 py-5 text-sm text-[var(--ink-soft)]">
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
+      <header className="rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-6 py-6">
+        <p className="text-[11px] uppercase tracking-[0.25em] text-[var(--ink-soft)]">
+          Centre de ressources
+        </p>
+        <h1 className="mt-2 text-3xl font-semibold">{title}</h1>
+        {subtitle ? (
+          <p className="mt-3 max-w-3xl text-sm text-[var(--ink-soft)]">{subtitle}</p>
+        ) : null}
+        {updatedAt ? (
+          <p className="mt-3 text-xs text-[var(--ink-soft)]">Dernière mise à jour: {updatedAt}</p>
+        ) : null}
+      </header>
+      <div className="grid gap-4">
         {children}
       </div>
     </div>
   )
 }
 
+function DocSection({
+  title,
+  children,
+}: {
+  title: string
+  children: React.ReactNode
+}) {
+  return (
+    <section className="rounded-2xl border border-[var(--line)] bg-[var(--surface-elev)] px-6 py-5">
+      <h2 className="text-xl font-semibold">{title}</h2>
+      <div className="mt-3 text-sm leading-relaxed text-[var(--ink-soft)]">
+        {children}
+      </div>
+    </section>
+  )
+}
+
 function PrivacyPolicy() {
   return (
-    <LegalPage title="Politique de confidentialité">
-      <p>
-        Nous collectons uniquement les données nécessaires au fonctionnement du
-        service (sessions, paramètres de sécurité, authentification).
-      </p>
-      <p className="mt-3">
-        Les contenus sont chiffrés côté client avant stockage. Nous ne conservons
-        pas de clé de déchiffrement.
-      </p>
-      <p className="mt-3">
-        Vos données sont supprimées à l’expiration ou après épuisement des vues.
-      </p>
-      <p className="mt-3">
-        Vous pouvez demander la suppression de votre compte à tout moment.
-      </p>
+    <LegalPage
+      title="Politique de confidentialité"
+      subtitle="Transparence sur les données traitées, les finalités et vos droits."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="1. Données traitées">
+        <p>
+          Nous limitons les données au strict nécessaire: adresse email (si compte),
+          empreinte de mot de passe, métadonnées de publication (dates, vues restantes,
+          type de contenu), journaux de sécurité et informations de session.
+        </p>
+        <p className="mt-3">
+          Le contenu des secrets est chiffré côté client avant envoi. Nous ne stockons
+          pas la clé de déchiffrement présente dans le fragment d’URL.
+        </p>
+      </DocSection>
+
+      <DocSection title="2. Finalités du traitement">
+        <ul className="list-disc pl-5">
+          <li>Fournir le service de création, partage et expiration des liens.</li>
+          <li>Sécuriser l’accès (authentification, MFA, protection contre les abus).</li>
+          <li>Assurer l’intégrité opérationnelle et le support utilisateur.</li>
+          <li>Respecter les obligations légales et de conformité.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="3. Durées de conservation">
+        <ul className="list-disc pl-5">
+          <li>Secrets: supprimés à expiration ou à épuisement des vues.</li>
+          <li>Comptes: conservés tant que le compte est actif.</li>
+          <li>Logs techniques de sécurité: conservation limitée et rotative.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="4. Sécurité et sous-traitance">
+        <p>
+          Les données transitent via HTTPS. Les accès d’administration sont restreints
+          et journalisés. Les prestataires d’infrastructure éventuels sont sélectionnés
+          pour leurs garanties de sécurité et de conformité.
+        </p>
+      </DocSection>
+
+      <DocSection title="5. Vos droits">
+        <p>
+          Selon la réglementation applicable (notamment RGPD), vous pouvez demander:
+          accès, rectification, effacement, limitation, opposition et portabilité.
+        </p>
+        <p className="mt-3">
+          Pour exercer vos droits ou signaler un incident, contactez le support via le
+          canal indiqué dans la page de contact.
+        </p>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function TermsOfUse() {
   return (
-    <LegalPage title="Conditions d'utilisation">
-      <p>
-        En utilisant Nemosyne, vous acceptez de ne pas partager de contenus
-        illégaux, malveillants ou non autorisés.
-      </p>
-      <p className="mt-3">
-        Le service est fourni « tel quel ». Nous nous engageons à sécuriser les
-        données et à limiter l’accès aux secrets via un lien unique.
-      </p>
-      <p className="mt-3">
-        Nous nous réservons le droit de suspendre un compte en cas d’abus.
-      </p>
+    <LegalPage
+      title="Conditions d'utilisation"
+      subtitle="Règles d’usage du service, responsabilités et limitations."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="1. Objet du service">
+        <p>
+          Nemosyne permet de partager des données sensibles via des liens chiffrés et
+          auto-destructibles. Le service est destiné à des usages professionnels ou
+          personnels légitimes.
+        </p>
+      </DocSection>
+
+      <DocSection title="2. Usage autorisé">
+        <ul className="list-disc pl-5">
+          <li>Vous vous engagez à ne pas publier de contenu illicite ou malveillant.</li>
+          <li>Vous êtes responsable des secrets partagés et des destinataires choisis.</li>
+          <li>Vous devez protéger vos identifiants et activer MFA quand disponible.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="3. Disponibilité et limites">
+        <p>
+          Le service est fourni « tel quel », avec un objectif de haute disponibilité.
+          Des interruptions temporaires peuvent survenir pour maintenance, sécurité ou
+          événement hors de notre contrôle.
+        </p>
+      </DocSection>
+
+      <DocSection title="4. Suspension et résiliation">
+        <p>
+          Nous pouvons limiter ou suspendre l’accès en cas d’abus, de tentative
+          d’intrusion, de fraude ou de non-respect des présentes conditions.
+        </p>
+      </DocSection>
+
+      <DocSection title="5. Responsabilité">
+        <p>
+          Nemosyne met en œuvre des mesures de sécurité raisonnables mais ne peut pas
+          garantir l’absence absolue de risque sur Internet. Vous devez compléter ces
+          mesures par vos propres politiques internes.
+        </p>
+      </DocSection>
+
+      <DocSection title="6. Droit applicable">
+        <p>
+          Les présentes conditions sont régies par le droit applicable au siège
+          d’exploitation du service, sous réserve des dispositions impératives locales.
+        </p>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function CookiePolicy() {
   return (
-    <LegalPage title="Politique de cookies">
-      <p>
-        Nous utilisons uniquement des cookies strictement nécessaires pour
-        maintenir votre session et protéger l’accès au service.
-      </p>
-      <p className="mt-3">
-        Aucun cookie publicitaire ni de tracking tiers n’est utilisé.
-      </p>
-      <p className="mt-3">
-        Vous pouvez à tout moment refuser les cookies non essentiels. Le refus
-        n’impacte pas l’accès au service, mais certaines fonctionnalités
-        (préférences d’interface) peuvent être limitées.
-      </p>
+    <LegalPage
+      title="Politique de cookies"
+      subtitle="Informations sur les cookies et stockages locaux utilisés par Nemosyne."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="1. Principes">
+        <p>
+          Nous privilégions une politique minimale: cookies strictement nécessaires à
+          la sécurité et au fonctionnement de la session. Aucun cookie publicitaire.
+        </p>
+      </DocSection>
+
+      <DocSection title="2. Types de traceurs utilisés">
+        <ul className="list-disc pl-5">
+          <li>Session de connexion sécurisée.</li>
+          <li>Préférences utilisateur (consentement cookies, thème d’interface).</li>
+          <li>Mécanismes anti-abus et protection d’accès.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="3. Durées et contrôle">
+        <p>
+          Les durées de conservation varient selon la finalité (session, préférence,
+          sécurité). Vous pouvez gérer ces préférences via la bannière de consentement
+          et les réglages de votre navigateur.
+        </p>
+      </DocSection>
+
+      <DocSection title="4. Désactivation">
+        <p>
+          La désactivation de certains traceurs peut limiter des fonctions non
+          essentielles (mémorisation d’interface) mais n’empêche pas l’usage de base.
+        </p>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function FeaturesPage() {
   return (
-    <LegalPage title="Caractéristiques">
-      <p>Chiffrement côté client (AES-GCM) avant stockage.</p>
-      <p className="mt-3">Liens secrets à usage limité avec expiration.</p>
-      <p className="mt-3">Partage de fichiers chiffrés jusqu’à 5 MB.</p>
-      <p className="mt-3">MFA TOTP, vérification email et sessions sécurisées.</p>
-      <p className="mt-3">Historique des pushes et tableau de bord.</p>
+    <LegalPage
+      title="Caractéristiques"
+      subtitle="Tout ce qu’il faut pour publier des données sensibles avec un minimum de friction."
+      updatedAt="28 février 2026"
+    >
+      <div className="grid gap-4 md:grid-cols-2">
+        <DocSection title="Chiffrement côté client">
+          <p>
+            Les contenus sont chiffrés dans le navigateur avant envoi. Le serveur ne
+            voit qu’un payload chiffré et des métadonnées minimales.
+          </p>
+        </DocSection>
+        <DocSection title="Liens à durée de vie contrôlée">
+          <p>
+            Double expiration configurable: par durée et par nombre de vues, avec
+            suppression automatique à la première condition atteinte.
+          </p>
+        </DocSection>
+        <DocSection title="Modes de publication">
+          <p>
+            Publication de texte, mots de passe, URL sensibles et fichiers (jusqu’à
+            5 MB). L’interface est optimisée pour un envoi en quelques secondes.
+          </p>
+        </DocSection>
+        <DocSection title="Protection renforcée">
+          <p>
+            Passphrase optionnelle côté destinataire + clé de lien. Authentification
+            compte avec MFA TOTP et vérification email.
+          </p>
+        </DocSection>
+        <DocSection title="Traçabilité opérationnelle">
+          <p>
+            Historique des publications, statut d’expiration et visibilité sur les
+            accès restants pour faciliter l’audit interne.
+          </p>
+        </DocSection>
+        <DocSection title="Conception orientée sobriété">
+          <p>
+            Interface centrée sur l’action principale: publier, partager, expirer.
+            Peu d’étapes, faible charge cognitive, conversion rapide.
+          </p>
+        </DocSection>
+      </div>
     </LegalPage>
   )
 }
 
 function PricingPage() {
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
       <h1 className="text-3xl font-semibold">Tarifs</h1>
-      <p className="text-sm text-[var(--ink-soft)]">
-        Des plans simples pour sécuriser et partager vos secrets.
+      <p className="max-w-3xl text-sm text-[var(--ink-soft)]">
+        Des plans conçus pour un déploiement progressif: essai rapide, montée en
+        charge individuelle, puis collaboration équipe.
       </p>
+
       <div className="grid gap-5 md:grid-cols-3">
         <div className="card-elev px-5 py-6">
           <p className="text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">Starter</p>
           <p className="mt-2 text-2xl font-semibold">0 €</p>
-          <p className="text-xs text-[var(--ink-soft)]">Pour essayer</p>
+          <p className="text-xs text-[var(--ink-soft)]">Pour tester le service</p>
           <ul className="mt-4 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
             <li>Jusqu’à 10 pushes / mois</li>
             <li>Expiration max 24h</li>
             <li>1 utilisateur</li>
+            <li>Support communautaire</li>
           </ul>
           <button className="mt-5 w-full rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
             Commencer
@@ -1697,12 +2218,13 @@ function PricingPage() {
         <div className="card-elev px-5 py-6 border border-[var(--primary)]">
           <p className="text-xs uppercase tracking-[0.2em] text-[var(--primary)]">Pro</p>
           <p className="mt-2 text-2xl font-semibold">9 € / mois</p>
-          <p className="text-xs text-[var(--ink-soft)]">Idéal pour les indépendants</p>
+          <p className="text-xs text-[var(--ink-soft)]">Idéal pour indépendants et petites équipes</p>
           <ul className="mt-4 flex flex-col gap-2 text-sm text-[var(--ink-soft)]">
             <li>Pushes illimités</li>
             <li>Expiration jusqu’à 7 jours</li>
             <li>Historique complet</li>
             <li>MFA & audit d’accès</li>
+            <li>Support prioritaire standard</li>
           </ul>
           <button className="mt-5 w-full rounded-full border border-[var(--primary)] bg-[var(--primary)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-white">
             Choisir Pro
@@ -1717,73 +2239,303 @@ function PricingPage() {
             <li>Jusqu’à 20 utilisateurs</li>
             <li>Rôles & permissions</li>
             <li>Support prioritaire</li>
+            <li>Accompagnement onboarding</li>
           </ul>
           <button className="mt-5 w-full rounded-full border border-[var(--line)] px-4 py-2 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
             Contacter
           </button>
         </div>
       </div>
+
+      <section className="grid gap-4 md:grid-cols-2">
+        <DocSection title="Ce qui est inclus dans tous les plans">
+          <ul className="list-disc pl-5">
+            <li>Chiffrement côté client.</li>
+            <li>Liens auto-destructibles.</li>
+            <li>Expiration par durée et vues.</li>
+            <li>Interface FR, usage mobile et desktop.</li>
+          </ul>
+        </DocSection>
+        <DocSection title="Questions fréquentes sur la facturation">
+          <ul className="list-disc pl-5">
+            <li>Changement de plan possible à tout moment.</li>
+            <li>Les tarifs sont indiqués hors taxes locales éventuelles.</li>
+            <li>Le plan Business peut être personnalisé sur demande.</li>
+          </ul>
+        </DocSection>
+      </section>
     </div>
   )
 }
 
 function ApiDocsPage() {
   return (
-    <LegalPage title="Documentation API">
-      <p>Créer un push: POST /api/push</p>
-      <p className="mt-3">Récupérer les métadonnées: GET /api/push/:id/meta</p>
-      <p className="mt-3">Révéler un secret: POST /api/push/:id/reveal</p>
-      <p className="mt-3">Session: GET /api/session</p>
-      <p className="mt-3">Authentification: /api/auth/*</p>
+    <LegalPage
+      title="Documentation API"
+      subtitle="Référence HTTP pour intégrer Nemosyne dans vos workflows internes."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="Base et format">
+        <ul className="list-disc pl-5">
+          <li>Base: <code>/api</code></li>
+          <li>Format: JSON UTF-8</li>
+          <li>Authentification: session cookie selon endpoint</li>
+          <li>Codes d’erreur: HTTP standard + message JSON {`{ error }`}</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="Endpoints principaux">
+        <ul className="list-disc pl-5">
+          <li><code>POST /api/push</code> créer une publication chiffrée</li>
+          <li><code>GET /api/push</code> lister les publications de l’utilisateur</li>
+          <li><code>POST /api/push/purge</code> purger les éléments expirés</li>
+          <li><code>GET /api/push/:id/meta</code> métadonnées d’une publication</li>
+          <li><code>POST /api/push/:id/reveal</code> consommer/révéler un secret</li>
+          <li><code>GET /api/session</code> état de session</li>
+          <li><code>/api/auth/*</code> login, register, verify, logout</li>
+          <li><code>/api/mfa/*</code> setup/enable MFA TOTP</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="Exemple: création d’un push">
+        <pre className="overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--surface-muted)] p-3 text-xs text-[var(--ink)]">
+{`POST /api/push
+Content-Type: application/json
+
+{
+  "kind": "text",
+  "label": "Acces VPN temporaire",
+  "createdAtTs": 1772304000000,
+  "expiresAtTs": 1772390400000,
+  "viewsLeft": 3,
+  "cipher": "base64...",
+  "iv": "base64...",
+  "salt": "base64...",
+  "requiresPassphrase": true
+}`}
+        </pre>
+      </DocSection>
+
+      <DocSection title="Exemple: réponse de création">
+        <pre className="overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--surface-muted)] p-3 text-xs text-[var(--ink)]">
+{`HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": "f2e7c9ab..."
+}`}
+        </pre>
+      </DocSection>
+
+      <DocSection title="Bonnes pratiques d’intégration">
+        <ul className="list-disc pl-5">
+          <li>Ne jamais journaliser la clé de déchiffrement côté client.</li>
+          <li>Envoyer le lien et la passphrase via deux canaux différents.</li>
+          <li>Gérer explicitement les erreurs d’expiration et de vues épuisées.</li>
+        </ul>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function WhatsNewPage() {
   return (
-    <LegalPage title="Quoi de neuf">
-      <p>Jan 2026: chiffrement fichiers, MFA TOTP et vérif email.</p>
-      <p className="mt-3">Déc 2025: thèmes clair/sombre et générateur de mots de passe.</p>
-      <p className="mt-3">Nov 2025: backend sécurisé et purge automatique.</p>
+    <LegalPage
+      title="Quoi de neuf"
+      subtitle="Journal de versions produit et améliorations récentes."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="Février 2026">
+        <ul className="list-disc pl-5">
+          <li>Refonte UX du flow de publication avec CTA toujours visible.</li>
+          <li>Hiérarchie simplifiée et options avancées en progressive disclosure.</li>
+          <li>Pages annexes enrichies pour une publication publique.</li>
+        </ul>
+      </DocSection>
+      <DocSection title="Janvier 2026">
+        <ul className="list-disc pl-5">
+          <li>Chiffrement des fichiers jusqu’à 5 MB.</li>
+          <li>Activation MFA TOTP et vérification email.</li>
+          <li>Amélioration du suivi d’historique des publications.</li>
+        </ul>
+      </DocSection>
+      <DocSection title="Décembre 2025">
+        <ul className="list-disc pl-5">
+          <li>Thèmes clair/sombre.</li>
+          <li>Générateur de mots de passe intégré.</li>
+          <li>Stabilisation des composants UI et accessibilité.</li>
+        </ul>
+      </DocSection>
+      <DocSection title="Novembre 2025">
+        <ul className="list-disc pl-5">
+          <li>Backend sécurisé avec purge automatique.</li>
+          <li>Première version des liens à expiration et vues limitées.</li>
+        </ul>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function PasswordGeneratorPage() {
   return (
-    <LegalPage title="Générateur de mot de passe">
-      <p>Générez des mots de passe forts, avec longueur et options.</p>
-      <p className="mt-3">Astuce: utilisez 16+ caractères et des symboles.</p>
+    <LegalPage
+      title="Générateur de mot de passe"
+      subtitle="Guide pratique pour créer des mots de passe robustes et utilisables."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="Configuration recommandée">
+        <ul className="list-disc pl-5">
+          <li>Longueur minimum: 16 caractères (idéalement 20+).</li>
+          <li>Activer majuscules, minuscules, chiffres et symboles.</li>
+          <li>Générer un mot de passe unique par service.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="Procédure opérationnelle">
+        <ol className="list-decimal pl-5">
+          <li>Choisir la longueur adaptée au niveau de risque.</li>
+          <li>Générer puis copier immédiatement dans un coffre-fort.</li>
+          <li>Ne jamais partager le mot de passe en clair dans un chat.</li>
+          <li>Utiliser un lien Nemosyne si un partage temporaire est nécessaire.</li>
+        </ol>
+      </DocSection>
+
+      <DocSection title="Checklist avant mise en production">
+        <ul className="list-disc pl-5">
+          <li>Rotation documentée des secrets critiques.</li>
+          <li>Politique de compromission et révocation testée.</li>
+          <li>MFA activé sur les comptes d’administration.</li>
+        </ul>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function KeyGeneratorPage() {
   return (
-    <LegalPage title="Générateur de clé">
-      <p>Générez une clé secrète pour partager un mémo chiffré.</p>
-      <p className="mt-3">Conservez cette clé hors de tout canal public.</p>
+    <LegalPage
+      title="Générateur de clé"
+      subtitle="Bonnes pratiques pour manipuler la clé de déchiffrement en sécurité."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="Rappel de fonctionnement">
+        <p>
+          Dans Nemosyne, la clé peut être incluse dans le fragment d’URL (
+          <code>#k=...</code>). Ce fragment est traité côté client et n’est pas envoyé
+          au serveur lors de la requête HTTP.
+        </p>
+      </DocSection>
+
+      <DocSection title="Partage sécurisé en 3 étapes">
+        <ol className="list-decimal pl-5">
+          <li>Envoyer le lien Nemosyne via un canal principal.</li>
+          <li>Transmettre la passphrase ou l’instruction d’accès via un second canal.</li>
+          <li>Valider la lecture puis laisser le secret expirer automatiquement.</li>
+        </ol>
+      </DocSection>
+
+      <DocSection title="À éviter absolument">
+        <ul className="list-disc pl-5">
+          <li>Copier la clé dans des tickets ou logs partagés.</li>
+          <li>Réutiliser la même clé/passphrase sur plusieurs envois.</li>
+          <li>Conserver les liens sensibles dans des espaces publics.</li>
+        </ul>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function BestPracticesPage() {
   return (
-    <LegalPage title="Bonnes pratiques">
-      <p>Ne partagez jamais la clé dans le même canal que le lien.</p>
-      <p className="mt-3">Activez MFA pour le compte administrateur.</p>
-      <p className="mt-3">Utilisez une passphrase unique par push.</p>
+    <LegalPage
+      title="Bonnes pratiques"
+      subtitle="Recommandations opérationnelles pour un usage sécurisé en équipe."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="Avant envoi">
+        <ul className="list-disc pl-5">
+          <li>Limiter le secret au strict minimum nécessaire.</li>
+          <li>Choisir une expiration courte adaptée au besoin.</li>
+          <li>Configurer un nombre de vues réaliste (1 à 5 le plus souvent).</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="Pendant le partage">
+        <ul className="list-disc pl-5">
+          <li>Séparer lien et passphrase sur deux canaux distincts.</li>
+          <li>Éviter les transferts automatiques non chiffrés.</li>
+          <li>Privilégier les destinataires nominativement identifiés.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="Après consultation">
+        <ul className="list-disc pl-5">
+          <li>Vérifier dans l’historique la consommation du secret.</li>
+          <li>Révoquer et regénérer en cas de doute.</li>
+          <li>Documenter les incidents dans votre registre interne.</li>
+        </ul>
+      </DocSection>
+
+      <DocSection title="Hygiène sécurité de l’organisation">
+        <ul className="list-disc pl-5">
+          <li>MFA obligatoire pour les comptes à privilèges.</li>
+          <li>Gestionnaire de secrets recommandé pour les éléments persistants.</li>
+          <li>Formation régulière des équipes aux risques de fuite de données.</li>
+        </ul>
+      </DocSection>
     </LegalPage>
   )
 }
 
 function FaqPage() {
   return (
-    <LegalPage title="FAQ">
-      <p>Q: Puis-je récupérer un secret expiré ?</p>
-      <p className="mt-2">R: Non, la suppression est définitive.</p>
-      <p className="mt-3">Q: Où est stockée la clé ?</p>
-      <p className="mt-2">R: Dans l’URL après #k= (côté client).</p>
+    <LegalPage
+      title="FAQ"
+      subtitle="Réponses aux questions les plus fréquentes avant déploiement public."
+      updatedAt="28 février 2026"
+    >
+      <DocSection title="Puis-je récupérer un secret expiré ?">
+        <p>
+          Non. La suppression à expiration ou après la dernière vue est définitive.
+        </p>
+      </DocSection>
+
+      <DocSection title="Où est stockée la clé de déchiffrement ?">
+        <p>
+          Elle est portée côté client dans le fragment d’URL (<code>#k=</code>) ou
+          dérivée depuis une passphrase. Elle n’est pas conservée en clair côté serveur.
+        </p>
+      </DocSection>
+
+      <DocSection title="Que se passe-t-il si le mauvais destinataire ouvre le lien ?">
+        <p>
+          La vue est consommée. Utilisez de préférence une passphrase pour ajouter une
+          barrière, et un nombre de vues faible pour limiter l’exposition.
+        </p>
+      </DocSection>
+
+      <DocSection title="Puis-je partager des fichiers volumineux ?">
+        <p>
+          La taille maximale actuelle est de 5 MB par fichier. Au-delà, privilégiez un
+          stockage dédié et partagez uniquement un token ou mot de passe via Nemosyne.
+        </p>
+      </DocSection>
+
+      <DocSection title="Nemosyne est-il adapté à la production ?">
+        <p>
+          Oui, à condition de respecter les bonnes pratiques: HTTPS strict, MFA activé,
+          politique d’expiration courte, supervision des accès et revue régulière des
+          incidents de sécurité.
+        </p>
+      </DocSection>
+
+      <DocSection title="Comment intégrer Nemosyne dans un workflow interne ?">
+        <p>
+          Utilisez les endpoints API documentés, automatisez la création de push,
+          transmettez les passphrases via un canal séparé et journalisez les opérations
+          critiques côté SI.
+        </p>
+      </DocSection>
     </LegalPage>
   )
 }
