@@ -56,6 +56,10 @@ const pool = new Pool({
 // In production on managed DBs, avoid running DDL as non-owner.
 const shouldMigrate = process.env.RUN_MIGRATIONS === 'true'
 
+function isInsufficientPrivilegeError(error) {
+  return Boolean(error && typeof error === 'object' && error.code === '42501')
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -146,6 +150,12 @@ async function initDb() {
 
 const dbReady = shouldMigrate
   ? initDb().catch((error) => {
+      if (isInsufficientPrivilegeError(error)) {
+        console.warn(
+          'Skipping migrations: database role lacks ownership/DDL privileges (code 42501).',
+        )
+        return
+      }
       console.error('Failed to initialize database', error)
       throw error
     })
@@ -1381,7 +1391,6 @@ if (process.env.VERCEL !== '1') {
 }
 
 // Final error handler: hide stack in prod
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err, _req, res, _next) => {
   console.error(err)
   res.status(500).json({ error: 'server-error' })

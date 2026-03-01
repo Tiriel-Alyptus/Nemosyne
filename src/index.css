@@ -101,6 +101,12 @@
     box-shadow: var(--ring);
   }
 
+  input[type='range']:focus-visible {
+    outline: none;
+    box-shadow: var(--ring);
+    border-radius: 999px;
+  }
+
   button {
     transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
   }
